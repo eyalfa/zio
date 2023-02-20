@@ -89,6 +89,28 @@ private[zio] final class PinchableArray[A: ClassTag](hint: Int) extends Iterable
     }
   }
 
+  case class Snapshot(offset : Int, size : Int) {
+    def drop(n : Int) : Snapshot = {
+      copy( offset = (offset + n) min size)
+    }
+
+    def chunk : Chunk[A] = Chunk.fromArray(_pinch).take(size).drop(offset)
+  }
+
+  def snapshot : Snapshot = {
+    val sz = self.size
+    this.pinch()
+    Snapshot(0, sz)
+  }
+
+  def appendFromSnapshot(snapshot : this.Snapshot) : this.type  = {
+    val sz = snapshot.size - snapshot.offset
+    ensureCapacity(sz)
+    Array.copy(_pinch, snapshot.offset, array, _size, sz)
+    _size += sz
+    this
+  }
+
   private[zio] def asChunk(): Chunk[A] =
     if (array == null) Chunk.empty
     else Chunk.fromArray(array).take(_size)
