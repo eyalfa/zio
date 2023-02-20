@@ -74,11 +74,11 @@ object GrowableArraySpec extends ZIOBaseSpec {
       val tr0 =  assertTrue {
         a.size == 0 &&
           s0.offset == 0 &&
-          s0.size == chunkRange.size &&
+          s0.limit == chunkRange.size &&
           s0.chunk == chunkRange
         } && assertTrue {
           s1.offset == 50 &&
-            s1.size == s0.size
+            s1.limit == s0.limit
         }
 
       //for some reason assertTrue breaks the chronological sequence of operations

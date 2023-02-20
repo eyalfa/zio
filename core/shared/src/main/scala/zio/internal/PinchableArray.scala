@@ -89,12 +89,15 @@ private[zio] final class PinchableArray[A: ClassTag](hint: Int) extends Iterable
     }
   }
 
-  case class Snapshot(offset : Int, size : Int) {
+  case class Snapshot(offset : Int, limit : Int) {
     def drop(n : Int) : Snapshot = {
-      copy( offset = (offset + n) min size)
+      copy( offset = (offset + n) min limit)
     }
 
-    def chunk : Chunk[A] = Chunk.fromArray(_pinch).take(size).drop(offset)
+    def length = limit - offset
+    def apply(i : Int) : A = self._pinch(offset + i)
+
+    def chunk : Chunk[A] = Chunk.fromArray(_pinch).take(limit).drop(offset)
   }
 
   def snapshot : Snapshot = {
@@ -103,11 +106,16 @@ private[zio] final class PinchableArray[A: ClassTag](hint: Int) extends Iterable
     Snapshot(0, sz)
   }
 
+  def emptySnapshot : Snapshot =
+    Snapshot(0, 0)
+
   def appendFromSnapshot(snapshot : this.Snapshot) : this.type  = {
-    val sz = snapshot.size - snapshot.offset
-    ensureCapacity(sz)
-    Array.copy(_pinch, snapshot.offset, array, _size, sz)
-    _size += sz
+    val sz = snapshot.limit - snapshot.offset
+    if(0 != sz) {
+      ensureCapacity(sz)
+      Array.copy(_pinch, snapshot.offset, array, _size, sz)
+      _size += sz
+    }
     this
   }
 
