@@ -22,13 +22,18 @@ import zio.Chunk
 private[zio] final class PinchableArray[A: ClassTag](hint: Int) extends Iterable[A] { self =>
   import java.lang.System
 
-  private var array  = if (hint < 0) null else new Array[A](hint)
-  private var _pinch = null.asInstanceOf[Array[A]]
+  private var array  = if (hint <= 0) Array.empty[A] else new Array[A](hint)
+  private var _pinch = Array.empty[A]
   private var _size  = 0
 
   def +=(a: A): Unit = {
     ensureCapacity(1)
 
+    array(_size) = a
+    _size += 1
+  }
+
+  def appendOneUnsafe(a : A): Unit = {
     array(_size) = a
     _size += 1
   }
@@ -46,9 +51,7 @@ private[zio] final class PinchableArray[A: ClassTag](hint: Int) extends Iterable
   def ensureCapacity(elements: Int): Unit = {
     val newSize = _size + elements
 
-    if (array eq null) {
-      array = new Array[A](newSize)
-    } else if (newSize > array.length) {
+    if (newSize > array.length) {
       val newStack = new Array[A](newSize + _size / 2)
       System.arraycopy(array, 0, newStack, 0, _size)
       array = newStack
@@ -77,7 +80,7 @@ private[zio] final class PinchableArray[A: ClassTag](hint: Int) extends Iterable
   def pinch(): Chunk[A] = {
     val size = self._size
 
-    if ((array eq null) || size == 0) Chunk.empty
+    if (size == 0) Chunk.empty
     else {
       ensurePinchCapacity(size)
 
@@ -109,7 +112,11 @@ private[zio] final class PinchableArray[A: ClassTag](hint: Int) extends Iterable
     if (0 == sz)
       emptySnapshot
     else {
-      this.pinch()
+      ensurePinchCapacity(sz)
+
+      System.arraycopy(array, 0, _pinch, 0, sz)
+
+      _size = 0
       Snapshot(0, sz)
     }
   }
@@ -131,9 +138,7 @@ private[zio] final class PinchableArray[A: ClassTag](hint: Int) extends Iterable
     else Chunk.fromArray(array).take(_size)
 
   private def ensurePinchCapacity(newSize: Int): Unit =
-    if (_pinch eq null) {
-      _pinch = new Array[A](newSize)
-    } else if (newSize > _pinch.length) {
+    if (newSize > _pinch.length) {
       _pinch = new Array[A](newSize)
     }
 
