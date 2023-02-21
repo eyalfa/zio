@@ -89,24 +89,24 @@ private[zio] final class PinchableArray[A: ClassTag](hint: Int) extends Iterable
     }
   }
 
-  case class Snapshot(offset : Int, limit : Int) {
-    def drop(n : Int) : Snapshot = {
+  case class Snapshot(offset: Int, limit: Int) {
+    def drop(n: Int): Snapshot = {
       val off2 = offset + n
-      if(off2 >= limit)
+      if (off2 >= limit)
         emptySnapshot
       else
-        copy( offset = off2)
+        copy(offset = off2)
     }
 
-    val length = limit - offset
-    def apply(i : Int) : A = self._pinch(offset + i)
+    val length           = limit - offset
+    def apply(i: Int): A = self._pinch(offset + i)
 
-    def chunk : Chunk[A] = Chunk.fromArray(_pinch).take(limit).drop(offset)
+    def chunk: Chunk[A] = Chunk.fromArray(_pinch).take(limit).drop(offset)
   }
 
-  def snapshot : Snapshot = {
+  def snapshot: Snapshot = {
     val sz = self._size
-    if(0 == sz)
+    if (0 == sz)
       emptySnapshot
     else {
       this.pinch()
@@ -114,11 +114,11 @@ private[zio] final class PinchableArray[A: ClassTag](hint: Int) extends Iterable
     }
   }
 
-  val emptySnapshot : Snapshot = Snapshot(0, 0)
+  val emptySnapshot: Snapshot = Snapshot(0, 0)
 
-  def appendFromSnapshot(snapshot : this.Snapshot) : this.type  = {
+  def appendFromSnapshot(snapshot: this.Snapshot): this.type = {
     val sz = snapshot.limit - snapshot.offset
-    if(0 != sz) {
+    if (0 != sz) {
       ensureCapacity(sz)
       Array.copy(_pinch, snapshot.offset, array, _size, sz)
       _size += sz
