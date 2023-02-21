@@ -57,7 +57,7 @@ object GrowableArraySpec extends ZIOBaseSpec {
 
   val buildSnapshot =
     test("pinch does a snapshot") {
-      val range = (0 to 100).map(_.toString)
+      val range      = (0 to 100).map(_.toString)
       val chunkRange = Chunk.fromIterable(range)
 
       val a = make(1)
@@ -66,23 +66,22 @@ object GrowableArraySpec extends ZIOBaseSpec {
         a += number.toString
       }
 
-
-
       val s0 = a.snapshot
       val s1 = s0.drop(50)
 
-      val tr0 =  assertTrue {
+      val tr0 = assertTrue {
         a.size == 0 &&
-          s0.offset == 0 &&
-          s0.limit == chunkRange.size &&
-          s0.chunk == chunkRange
-        } && assertTrue {
-          s1.offset == 50 &&
-            s1.limit == s0.limit
-        }
+        s0.offset == 0 &&
+        s0.limit == chunkRange.size &&
+        s0.chunk == chunkRange
+      } && assertTrue {
+        s1.offset == 50 &&
+        s1.limit == s0.limit
+      }
 
       //for some reason assertTrue breaks the chronological sequence of operations
-      if(tr0.isFailure) tr0 else {
+      if (tr0.isFailure) tr0
+      else {
         assertTrue {
           a.appendFromSnapshot(s1)
           chunkRange.drop(50) == s1.chunk
