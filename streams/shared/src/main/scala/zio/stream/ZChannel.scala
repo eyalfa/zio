@@ -1775,17 +1775,15 @@ object ZChannel {
                        mergeStrategy match {
                          case MergeStrategy.BackPressure =>
                            for {
-                             latch <- Promise.make[Nothing, Unit]
+                             localScope <- zio.Scope.make
                              raceIOs =
-                               /*ZIO.scopedWith { scope =>
-                                 (queueReader >>> channel)
-                                   .toPullIn(scope)
-                                   .flatMap(evaluatePull(_).raceAwait(errorSignal.await.interruptible))
-                               }*/  evaluateChannel(queueReader >>> channel).race(errorSignal.await.interruptible)
-                             childFiber <- permits
-                                             .withPermit(latch.succeed(()) *> raceIOs)
-                                             .forkIn(scope)
-                             _       <- latch.await
+                               evaluateChannel(queueReader >>> channel).race(errorSignal.await.interruptible)
+                             fib2 <- ZIO.uninterruptibleMask{ restore =>
+                               permits.withPermitScoped.provideEnvironment(ZEnvironment(localScope)) *>
+                                 restore(raceIOs)
+                                   .onExit(localScope.close(_))
+                                   .forkIn(scope)
+                             }
                              errored <- errorSignal.isDone
                            } yield !errored
                          case MergeStrategy.BufferSliding =>
