@@ -1838,33 +1838,37 @@ object ZChannel {
           var aggDone = Option.empty[OutDone]
           var totalN = -1
 
-          lazy val consumer: ZChannel[Env, Any, Any, Any, OutErr, OutElem, OutDone] =
-            unwrap[Env, Any, Any, Any, OutErr, OutElem, OutDone] {
+          lazy val consumer: ZChannel[Env, Any, Any, Any, OutErr, OutElem, OutDone] = {
+            lazy val z : ZIO[Any, Nothing, ZChannel[Env, Any, Any, Any, OutErr, OutElem, OutDone]] =
               queue
                 .take
-                .map {
+                .flatMap{
                   case zio.Exit.Success(Right(outElem: OutElem)) =>
-                    write(outElem) *> consumer
+                    zio.Exit.succeed(write(outElem) *> consumer)
                   case zio.Exit.Success(Left((outDone, None))) =>
                     completedChannels += 1
                     aggDone = aggDone.map(f(_, outDone)).orElse(Some(outDone))
                     if(totalN == completedChannels)
-                      ZChannel.succeedNow(aggDone.get)
+                      zio.Exit.succeed(ZChannel.succeedNow(aggDone.get))
                     else
-                      consumer
+                      z
                   case zio.Exit.Success(Left((outDone, Some(n)))) =>
                     aggDone = aggDone.map(f(_, outDone)).orElse(Some(outDone))
                     totalN = n
                     if(n == completedChannels)
-                      ZChannel.succeedNow(aggDone.get)
+                      zio.Exit.succeed(ZChannel.succeedNow(aggDone.get))
                     else
-                      consumer
+                      z
                   case zio.Exit.Failure(c) =>
-                    refailCause(c)
+                    zio.Exit.succeed(refailCause(c))
                 }
-            }
 
-            consumer
+            unwrap[Env, Any, Any, Any, OutErr, OutElem, OutDone] {
+              z
+            }
+          }
+
+          consumer
         }
 
         susspended.embedInput(input)
