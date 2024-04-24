@@ -1723,7 +1723,18 @@ object ZChannel {
     mergeStrategy: => MergeStrategy = MergeStrategy.BackPressure
   )(
     f: (OutDone, OutDone) => OutDone
-  )(implicit trace: Trace): ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone] =
+  )(implicit trace: Trace): ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone] = {
+    def withCount : ZChannel[Any, OutErr, ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone], OutDone, OutErr, ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone], (OutDone, Int)] = ZChannel.suspend {
+      var n = 0
+      lazy val reader : ZChannel[Any, OutErr, ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone], OutDone, OutErr, ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone], (OutDone, Int)] =
+        ZChannel.readWithCause(
+          in => {n += 1; ZChannel.write(in) *> reader},
+          ZChannel.refailCause(_),
+          done => ZChannel.succeedNow((done, n))
+        )
+      reader
+    }
+
     unwrapScopedWith { scope =>
       {
         for {
@@ -1732,14 +1743,15 @@ object ZChannel {
           n             <- ZIO.succeed(n)
           bufferSize    <- ZIO.succeed(bufferSize)
           mergeStrategy <- ZIO.succeed(mergeStrategy)
-          queue         <- Queue.bounded[ZIO[Env, OutErr, Either[OutDone, OutElem]]](bufferSize)
+          queue         <- Queue.bounded[zio.Exit[OutErr, Either[(OutDone, Option[Int]), OutElem]]](bufferSize)
+            //[ZIO[Env, OutErr, Either[OutDone, OutElem]]](bufferSize)
           _             <- scope.addFinalizer(queue.shutdown)
           cancelers     <- Queue.unbounded[Promise[Nothing, Unit]]
           _             <- scope.addFinalizer(cancelers.shutdown)
-          lastDone      <- Ref.make[Option[OutDone]](None)
+          //lastDone      <- Ref.make[Option[OutDone]](None)
           errorSignal   <- Promise.make[Nothing, Unit]
           permits       <- Semaphore.make(n.toLong)
-          pull          <- (queueReader >>> channels).toPullIn(scope)
+          pull          <- (queueReader >>> channels >>> withCount).toPullIn(scope)
           evaluateChannel = { (ch: ZChannel[Env, Any, Any, Any, OutErr, OutElem, OutDone]) =>
               ch
                 .mapOutZIO(in => queue.offer(zio.Exit.succeed(Right(in))))
@@ -1747,10 +1759,7 @@ object ZChannel {
                 .foldCauseZIO(
                   err => queue.offer(zio.Exit.failCause(err)) *> errorSignal.succeed(()),
                   outDone => {
-                    lastDone.update {
-                      case Some(lastDone) => Some(f(lastDone, outDone))
-                      case None => Some(outDone)
-                    }
+                    queue.offer(zio.Exit.succeed(Left(outDone -> None)))
                   }
                 )
                 .unit
@@ -1758,11 +1767,17 @@ object ZChannel {
           _ <- pull
                  .foldCauseZIO(
                    cause =>
-                     ZIO.failCause(cause).exit.flatMap(queue.offer(_))  *>
-                       ZIO.succeed(false),
+                     ZIO
+                       .failCause(cause).exit.flatMap(queue.offer(_))
+                       .as(false)
+                   ,
                    {
-                     case Left(outDone) =>
-                       errorSignal.await.interruptible.raceWith(permits.withPermits(n.toLong)(ZIO.unit).interruptible)(
+                     case Left((outDone, n)) =>
+                       queue
+                         .offer(zio.Exit.succeed(Left(outDone -> Some(n))))
+                         .as(false)
+
+                       /*errorSignal.await.interruptible.raceWith(permits.withPermits(n.toLong)(ZIO.unit).interruptible)(
                          leftDone = (_, permitAcquisition) => permitAcquisition.interrupt.as(false),
                          rightDone = (_, failureAwait) =>
                            failureAwait.interrupt *>
@@ -1770,7 +1785,7 @@ object ZChannel {
                                case Some(lastDone) => queue.offer(zio.Exit.succeed(Left(f(lastDone, outDone))))
                                case None           => queue.offer(zio.Exit.succeed(Left(outDone)))
                              }.as(false)
-                       )
+                       )*/
                      case Right(channel) =>
                        mergeStrategy match {
                          case MergeStrategy.BackPressure =>
@@ -1818,31 +1833,44 @@ object ZChannel {
                  .forkIn(scope)
         } yield (queue, input)
       }.map { case (queue, input) =>
-        lazy val consumer: ZChannel[Env, Any, Any, Any, OutErr, OutElem, OutDone] =
-          unwrap[Env, Any, Any, Any, OutErr, OutElem, OutDone] {
-            /*queue.take.flatten.foldCause(
-              cause => failCause(cause),
-              {
-                case Left(outDone)  => succeedNow(outDone)
-                case Right(outElem) => write(outElem) *> consumer
-              }
-            )*/
+        val susspended: ZChannel[Env, Any, Any, Any, OutErr, OutElem, OutDone] = ZChannel.suspend {
+          var completedChannels = 0
+          var aggDone = Option.empty[OutDone]
+          var totalN = -1
 
-            queue
-              .take
-              .map{
-                case zio.Exit.Success(Left(outDone)) =>
-                  succeedNow(outDone)
-                case zio.Exit.Success(Right(outElem: OutElem)) =>
-                  write(outElem) *> consumer
-                case zio.Exit.Failure(c) =>
-                  refailCause(c)
-              }
-          }
+          lazy val consumer: ZChannel[Env, Any, Any, Any, OutErr, OutElem, OutDone] =
+            unwrap[Env, Any, Any, Any, OutErr, OutElem, OutDone] {
+              queue
+                .take
+                .map {
+                  case zio.Exit.Success(Right(outElem: OutElem)) =>
+                    write(outElem) *> consumer
+                  case zio.Exit.Success(Left((outDone, None))) =>
+                    completedChannels += 1
+                    aggDone = aggDone.map(f(_, outDone)).orElse(Some(outDone))
+                    if(totalN == completedChannels)
+                      ZChannel.succeedNow(aggDone.get)
+                    else
+                      consumer
+                  case zio.Exit.Success(Left((outDone, Some(n)))) =>
+                    aggDone = aggDone.map(f(_, outDone)).orElse(Some(outDone))
+                    totalN = n
+                    if(n == completedChannels)
+                      ZChannel.succeedNow(aggDone.get)
+                    else
+                      consumer
+                  case zio.Exit.Failure(c) =>
+                    refailCause(c)
+                }
+            }
 
-        consumer.embedInput(input)
+            consumer
+        }
+
+        susspended.embedInput(input)
       }
     }
+  }
 
   /** Returns a channel that never completes */
   final def never(implicit trace: Trace): ZChannel[Any, Any, Any, Any, Nothing, Nothing, Nothing] =
