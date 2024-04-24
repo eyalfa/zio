@@ -1798,14 +1798,16 @@ object ZPipeline extends ZPipelinePlatformSpecificConstructors {
    */
   def mapZIOPar[Env, Err, In, Out](n: => Int)(f: In => ZIO[Env, Err, Out])(implicit
     trace: Trace
-  ): ZPipeline[Env, Err, In, Out] =
-    new ZPipeline(
-      ZChannel
-        .identity[Nothing, Chunk[In], Any]
+  ): ZPipeline[Env, Err, In, Out] = {
+    ZPipeline.fromFunction{ (strm : ZStream[Any, Nothing, In]) =>
+      strm
+        .toChannel
         .concatMap(ZChannel.writeChunk(_))
         .mapOutZIOPar(n)(f)
         .mapOut(Chunk.single)
-    )
+        .toStream
+    }
+  }
 
   /**
    * Maps over elements of the stream with the specified effectful function,
@@ -1814,13 +1816,21 @@ object ZPipeline extends ZPipelinePlatformSpecificConstructors {
    */
   def mapZIOParUnordered[Env, Err, In, Out](n: => Int)(f: In => ZIO[Env, Err, Out])(implicit
     trace: Trace
-  ): ZPipeline[Env, Err, In, Out] =
-    new ZPipeline(
+  ): ZPipeline[Env, Err, In, Out] = {
+    ZPipeline.fromFunction{ (strm : ZStream[Any, Nothing, In]) =>
+      strm
+        .toChannel
+        .concatMap(ZChannel.writeChunk(_))
+        .mergeMap(n, 16)(in => ZStream.fromZIO(f(in)).channel)
+        .toStream
+    }
+    /*new ZPipeline(
       ZChannel
         .identity[Nothing, Chunk[In], Any]
         .concatMap(ZChannel.writeChunk(_))
         .mergeMap(n, 16)(in => ZStream.fromZIO(f(in)).channel)
-    )
+    )*/
+  }
 
   /**
    * Emits the provided chunk before emitting any other value.
