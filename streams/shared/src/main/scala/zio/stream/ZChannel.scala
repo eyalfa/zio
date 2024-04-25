@@ -1809,17 +1809,18 @@ object ZChannel {
                              _        <- ZIO.when(size >= n)(cancelers.take.flatMap(_.succeed(())))
                              _        <- cancelers.offer(canceler)
                              raceIOs =
-                               /*ZIO.scopedWith { scope =>
-                                 (queueReader >>> channel)
-                                   .toPullIn(scope)
-                                   .flatMap(
-                                     evaluatePull(_)
-                                       .raceAwait(errorSignal.await.interruptible)
-                                       .raceAwait(canceler.await.interruptible)
-                                   )
-                               }*/ evaluateChannel(queueReader >>> channel)
+                               evaluateChannel{
+                                 queueReader >>>
+                                   channel
+                                     .mergeWith(ZChannel.fromZIO(canceler.await))(
+                                       ex => MergeDecision.done(ex),
+                                       ex => {
+                                         MergeDecision.done(ex.as(null.asInstanceOf[OutDone]))
+                                       }
+                                     )
+                               }
                                .raceAwait(errorSignal.await.interruptible)
-                               .raceAwait(canceler.await.interruptible)
+                               //.raceAwait(canceler.await.interruptible)
                              childFiber <- permits
                                              .withPermit(latch.succeed(()) *> raceIOs)
                                              .forkIn(scope)
@@ -1847,7 +1848,9 @@ object ZChannel {
                     zio.Exit.succeed(write(outElem) *> consumer)
                   case zio.Exit.Success(Left((outDone, None))) =>
                     completedChannels += 1
-                    aggDone = aggDone.map(f(_, outDone)).orElse(Some(outDone))
+                    if(null != outDone) {
+                      aggDone = aggDone.map(f(_, outDone)).orElse(Some(outDone))
+                    }
                     if(totalN == completedChannels)
                       zio.Exit.succeed(ZChannel.succeedNow(aggDone.get))
                     else
