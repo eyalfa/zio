@@ -1800,12 +1800,13 @@ object ZPipeline extends ZPipelinePlatformSpecificConstructors {
     trace: Trace
   ): ZPipeline[Env, Err, In, Out] = {
     ZPipeline.fromFunction{ (strm : ZStream[Any, Nothing, In]) =>
-      strm
+      /*strm
         .toChannel
         .concatMap(ZChannel.writeChunk(_))
         .mapOutZIOPar(n)(f)
         .mapOut(Chunk.single)
-        .toStream
+        .toStream*/
+      strm.mapZIOPar(n)(f)
     }
   }
 
