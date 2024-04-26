@@ -1818,11 +1818,12 @@ object ZPipeline extends ZPipelinePlatformSpecificConstructors {
     trace: Trace
   ): ZPipeline[Env, Err, In, Out] = {
     ZPipeline.fromFunction{ (strm : ZStream[Any, Nothing, In]) =>
-      strm
+      /*strm
         .toChannel
         .concatMap(ZChannel.writeChunk(_))
         .mergeMap(n, 16)(in => ZStream.fromZIO(f(in)).channel)
-        .toStream
+        .toStream*/
+      strm.mapZIOParUnordered(n)(f)
     }
     /*new ZPipeline(
       ZChannel
