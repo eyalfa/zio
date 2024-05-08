@@ -2559,6 +2559,41 @@ sealed trait ZIO[-R, +E, +A]
       }
     }
 
+  final def zipWithParNew[R1 <: R, E1 >: E, B, C](
+    that: => ZIO[R1, E1, B]
+  )(f: (A, B) => C)(implicit trace: Trace): ZIO[R1, E1, C] =
+    ZIO.transplant { grafter =>
+      grafter(self)
+        .raceWith(grafter(that))(
+          { case (exLeft, rightFib) =>
+            exLeft
+              .foldExit(
+                c0 =>
+                  rightFib.interrupt.flatMap {
+                    _.foldExit(
+                      c1 => Exit.failCause(c0 ++ c1),
+                      _ => Exit.failCause[E1](c0)
+                    )
+                  },
+                a => rightFib.join.map(f(a, _))
+              )
+          },
+          { case (rightEx, leftFib) =>
+            rightEx
+              .foldExit(
+                c0 =>
+                  leftFib.interrupt.flatMap {
+                    _.foldExit(
+                      c1 => Exit.failCause(c1 ++ c0),
+                      _ => ZIO.refailCause[E1](c0)
+                    )
+                  },
+                b => leftFib.join.map(f(_, b))
+              )
+          }
+        )
+    }
+
   private[this] final def tryOrElse[R1 <: R, E2, B](
     that: => ZIO[R1, E2, B],
     success: A => ZIO[R1, E2, B]
