@@ -79,6 +79,16 @@ class ForEachBenchmark {
   }
 
   @Benchmark
+  def zioForEachParDiscard(): Int = {
+
+    val io = for {
+      _ <- ZIO.foreachParDiscard(ints)(ZIO.succeed(_))
+    } yield 0
+
+    unsafeRun(io)
+  }
+
+  @Benchmark
   def zioForEachForkAwait(): Int = {
 
     val io = for {
