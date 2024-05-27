@@ -220,6 +220,7 @@ final class Promise[E, A] private (
 
   private[zio] trait UnsafeAPI {
     def done(io: IO[E, A])(implicit unsafe: Unsafe): Unit
+    def poll(implicit unsafe: Unsafe): Option[IO[E, A]]
   }
 
   @transient private[zio] val unsafe: UnsafeAPI =
@@ -243,6 +244,12 @@ final class Promise[E, A] private (
 
         if (joiners ne null) joiners.foreach(_(io))
       }
+
+      def poll(implicit unsafe: Unsafe): Option[IO[E, A]] =
+        state.get match {
+          case Pending(_) => None
+          case Done(io)   => Some(io)
+        }
     }
 }
 object Promise {
