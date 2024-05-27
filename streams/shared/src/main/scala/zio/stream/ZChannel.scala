@@ -6,6 +6,8 @@ import zio.stream.internal.{AsyncInputConsumer, AsyncInputProducer, ChannelExecu
 import ChannelExecutor.ChannelState
 import zio.stream.ZChannel.QRes
 
+import scala.reflect.ClassTag
+
 /**
  * A `ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone]` is a nexus
  * of I/O operations, which supports both reading and writing. A channel may
@@ -623,6 +625,76 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
     self >>> reader
   }
 
+  private class PendingQueue[A : ClassTag](n : Int) {
+    val arrs = Array.fill(3)(new Array[A](n))
+    var startOff, endBatch, endOff = 0
+    //private var view0 = Chunk.fromArray(arrs(0)) ++ Chunk.fromArray(arrs(1)) ++ Chunk.fromArray(arrs(2))
+
+    def size = (endOff - startOff) + (n * endBatch)
+
+    def enqueue(a : A) = {
+      if(endOff < n) {
+        arrs(endBatch)(endOff) = a
+        endOff += 1
+      } else {
+        require( endBatch < 2, "damn!, I'm full")
+        endBatch += 1
+        endOff = 1
+        arrs(endBatch)(0) = a
+      }
+    }
+    def dequeue: A = {
+      require(this.size > 0, "damn! I'm empty")
+      val res = arrs(0)(startOff)
+      startOff += 1
+      if(startOff == n) {
+        startOff = 0
+        endBatch = (endBatch - 1) max 0
+        arrs(0) = arrs(1)
+        arrs(1) = arrs(2)
+        arrs(2) = new Array[A](n)
+        //view0 = Chunk.fromArray(arrs(0)) ++ Chunk.fromArray(arrs(1)) ++ Chunk.fromArray(arrs(2))
+      }
+      res
+    }
+
+    /*def view: Chunk[A] = {
+      view0.slice(startOff, n * endBatch + endOff)
+    }*/
+
+    def view: Iterable[A] = new Iterable[A] {
+
+      override def iterator: Iterator[A] = new Iterator[A] {
+        val arrs = PendingQueue.this.arrs
+        val endBatch = PendingQueue.this.endBatch
+        val endOff = PendingQueue.this.endOff
+        var currArr = 0
+        var off = PendingQueue.this.startOff
+
+        override def hasNext: Boolean = (currArr != endBatch) || (off != endOff)
+
+        override def next(): A = {
+          val res = arrs(currArr)(off)
+          off += 1
+          if(off == n) {
+            currArr += 1
+            off = 0
+          }
+          res
+        }
+      }
+    }
+
+    def update(a : A): Iterable[A] = {
+      if(size == 2 * n) {
+        this.dequeue
+      }
+      this.enqueue(a)
+      val v = this.view
+      v
+    }
+  }
+
   /**
    * Creates a channel that is like this channel but the given ZIO function gets
    * applied to each emitted output element, taking `n` elements at once and
@@ -643,7 +715,8 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
       queue           <- Queue.bounded[(OutElem, zio.Promise[OutErr1, OutElem2])](n)
       downstreamQueue <- Queue.bounded[Any](bufferSize)
       failureSignal   <- Promise.make[OutErr1, Nothing]
-      pending         <- Ref.make(collection.immutable.Queue.empty[zio.Promise[OutErr1, OutElem2]])
+      pending         <- Ref.make(Iterable.empty[zio.Promise[OutErr1, OutElem2]])
+      pendingQueue = new PendingQueue[zio.Promise[OutErr1, OutElem2]](n + 1)
     } yield {
 
       //the pending queue holds the last 2n+1 enqueued work items, this covers a potentially full queue + n in progress queue.take operations,
@@ -693,16 +766,8 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
                 prom <- zio.Promise.make[OutErr1, OutElem2]
                 tup   = (in, prom)
                 _    <- workerFiber.unless(numForked == n)
-                _ <- pending.update { prev =>
-                       val next0 =
-                         if (prev.size == 2 * n + 2)
-                           prev.dequeue._2
-                         else
-                           prev
-
-                       val next1 = next0.enqueue(prom)
-                       next1
-                     }
+               pendingView = pendingQueue.update(prom)
+                _ <- pending.set(pendingView)
                 _ <- queue.offer(tup)
                 _ <- downstreamQueue.offer(prom)
               } yield {
