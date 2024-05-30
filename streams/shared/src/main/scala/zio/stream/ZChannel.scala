@@ -4,7 +4,7 @@ import zio.{ZIO, _}
 import zio.stacktracer.TracingImplicits.disableAutoTrace
 import zio.stream.internal.{AsyncInputConsumer, AsyncInputProducer, ChannelExecutor, SingleProducerAsyncInput}
 import ChannelExecutor.ChannelState
-import zio.stream.ZChannel.QRes
+import zio.stream.ZChannel.{MergeDecision, QRes}
 
 /**
  * A `ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone]` is a nexus
@@ -957,7 +957,7 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
    * termination is decided by the specified `leftDone` and `rightDone` merge
    * decisions.
    */
-  final def mergeWith[
+  final def mergeWith0[
     Env1 <: Env,
     InErr1 <: InErr,
     InElem1 <: InElem,
@@ -1095,6 +1095,144 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
       }
 
     ZChannel.unwrapScopedWith(m)
+  }
+
+  final def mergeWith[
+    Env1 <: Env,
+    InErr1 <: InErr,
+    InElem1 <: InElem,
+    InDone1 <: InDone,
+    OutErr2,
+    OutErr3,
+    OutElem1 >: OutElem,
+    OutDone2,
+    OutDone3
+  ](that: ZChannel[Env1, InErr1, InElem1, InDone1, OutErr2, OutElem1, OutDone2])(
+    leftDone: Exit[OutErr, OutDone] => ZChannel.MergeDecision[Env1, OutErr2, OutDone2, OutErr3, OutDone3],
+    rightDone: Exit[OutErr2, OutDone2] => ZChannel.MergeDecision[Env1, OutErr, OutDone, OutErr3, OutDone3]
+  )(implicit trace: Trace): ZChannel[Env1, InErr1, InElem1, InDone1, OutErr3, OutElem1, OutDone3] = {
+    val z: ZIO[Env1, Nothing, ZChannel[Any, InErr1, InElem1, InDone1, OutErr3, OutElem1, OutDone3]] = for {
+      env1 <- ZIO.environment[Env1]
+      input      <- SingleProducerAsyncInput.make[InErr1, InElem1, InDone1]
+      queueReader = ZChannel.fromInput(input)
+      q <- Queue.bounded[Any](4)
+    } yield {
+      lazy val enqueuerSinkCh : ZChannel[Any, Either[OutErr, OutErr2],  OutElem1, Either[OutDone, OutDone2], Nothing, Nothing, Any] =
+        ZChannel
+          .readWithCause(
+            a => ZChannel.fromZIO(q.offer(a)) *> enqueuerSinkCh,
+            err => ZChannel.fromZIO(q.offer(QRes(Exit.failCause(err)))),
+            done => ZChannel.fromZIO(q.offer(QRes(Exit.succeed(done))))
+          )
+
+      val leftFib = queueReader
+        .pipeTo(self)
+          .foldCauseChannel(
+            err => ZChannel.refailCause(err.map(Left(_))),
+            done => ZChannel.succeedNow(Left(done))
+          )
+          .pipeTo(enqueuerSinkCh)
+          .provideEnvironment(env1)
+          .runScoped
+          .forkScoped
+      val rightFib = queueReader
+        .pipeTo(that)
+        .foldCauseChannel(
+          err => ZChannel.refailCause(err.map(Right(_))),
+          done => ZChannel.succeedNow(Right(done))
+        )
+        .pipeTo(enqueuerSinkCh)
+        .provideEnvironment(env1)
+        .runScoped
+        .forkScoped
+
+      lazy val bothRunning : ZChannel[Any, Any, Any, Any, OutErr3, OutElem1, OutDone3] = {
+        ZChannel
+          .fromZIO(q.take)
+          .flatMap{
+            case QRes(x) =>
+              val ex = x.asInstanceOf[zio.Exit[Either[OutErr, OutErr2], Either[OutDone, OutDone2]]]
+              ex.foldExit(
+                err => err.fold(
+                  ZChannel.failCause(Cause.empty),
+                  (either, stackTrace) => either.fold(
+                    err => onLeftDecision(leftDone(zio.Exit.fail(err))),
+                    err => onRightDecision(rightDone(zio.Exit.fail(err)))
+                  ),
+                  (th, stackTrace) => ZChannel.failCause(Cause.die(th, stackTrace)),
+                  (fId, stackTrace) => ZChannel.failCause(Cause.interrupt(fId, stackTrace))
+                )(
+                  _ *> _,
+                  _ *> _,
+                  (res, b) => res
+                ),
+                done => done.fold(
+                  d => onLeftDecision(leftDone(Exit.succeed(d))),
+                  d => onRightDecision(rightDone(Exit.succeed(d)))
+                )
+              )
+            case elem : OutElem1 @unchecked =>
+              ZChannel.write(elem) *> bothRunning
+          }
+      }
+
+      def onLeftDecision(d : ZChannel.MergeDecision[Env1, OutErr2, OutDone2, OutErr3, OutDone3]) : ZChannel[Any, Any, Any, Any, OutErr3, OutElem1, OutDone3] =
+        d match {
+          case MergeDecision.Done(done) =>
+            ZChannel.fromZIO(done.provideEnvironment(env1))
+          case MergeDecision.Await(f) =>
+            lazy val drain : ZChannel[Any, Any, Any, Any, OutErr3, OutElem1, OutDone3] =
+              ZChannel
+              .fromZIO(q.take)
+              .flatMap{
+                case QRes(x) =>
+                  val ex = x.asInstanceOf[Exit[Right[OutErr, OutErr2], Right[OutDone, OutDone2]]]
+                  val ex1 = ex.mapBothExit(
+                    {case Right(err) => err},
+                    {case Right(done) => done}
+                  )
+                  ZChannel.fromZIO(f(ex1).provideEnvironment(env1))
+                case elem : OutElem1 =>
+                  ZChannel.write(elem) *> drain
+              }
+            drain
+        }
+
+      def onRightDecision(d : ZChannel.MergeDecision[Env1, OutErr, OutDone, OutErr3, OutDone3]) : ZChannel[Any, Any, Any, Any, OutErr3, OutElem1, OutDone3] =
+        d match {
+          case MergeDecision.Done(done) =>
+            ZChannel.fromZIO(done.provideEnvironment(env1))
+          case MergeDecision.Await(f) =>
+            lazy val drain : ZChannel[Any, Any, Any, Any, OutErr3, OutElem1, OutDone3] =
+              ZChannel
+                .fromZIO(q.take)
+                .flatMap{
+                  case QRes(x) =>
+                    val ex = x.asInstanceOf[Exit[Left[OutErr, OutErr2], Left[OutDone, OutDone2]]]
+                    val ex1 = ex.mapBothExit(
+                      {case Left(err) => err},
+                      {case Left(done) => done}
+                    )
+                    ZChannel.fromZIO(f(ex1).provideEnvironment(env1))
+                  case elem : OutElem1 =>
+                    ZChannel.write(elem) *> drain
+                }
+            drain
+        }
+
+      val resCh: ZChannel[Any, InErr1, InElem1, InDone1, OutErr3, OutElem1, OutDone3] = ZChannel
+        .scoped[Any](leftFib <*> rightFib)
+        .concatMapWith{ fibs =>
+          bothRunning
+        } (
+          {case (x, _) => x},
+          {case (x, _) => x}
+        )
+        .embedInput(input)
+      resCh
+    }
+
+    ZChannel.unwrap(z)
   }
 
   /** Returns a channel that never completes */
