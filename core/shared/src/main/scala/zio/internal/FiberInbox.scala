@@ -3,44 +3,60 @@ package zio.internal
 import java.util.concurrent.atomic.AtomicReference
 import scala.annotation.tailrec
 
-class FiberInbox extends AtomicReference[AnyRef] {
-  var dequeued = List.empty[FiberMessage]
+class FiberInbox extends AtomicReference(List.empty[FiberMessage]) {
+  var dequeued, pending = List.empty[FiberMessage]
+  var nonEmptyHint = false
 
-  def isEmpty = dequeued.isEmpty && (this.get() eq null)
-  def nonEmpty = dequeued.nonEmpty || (this.get() ne null)
+  def isEmpty =
+    !nonEmptyHint &&
+      (this.get() eq Nil)
 
-  def enqueue(msg : FiberMessage): Unit = {
-    this.getAndUpdate{
-      case null => msg
-      case prev => (msg, prev)
-    }
+
+  //def nonEmpty = dequeued.nonEmpty || (this.get().nonEmpty)
+
+  def add(msg : FiberMessage): Unit = {
+    nonEmptyHint = true
+    this.getAndUpdate(msg :: _)
   }
-  
-  def poll : FiberMessage = {
-    dequeued match {
-      case res :: rest =>
-        dequeued = rest
-        res
-      case _ =>
-        val reversed = this.getAndSet(null)
-        reversed match {
-          case null => null
-          case msg : FiberMessage => msg
-          case (msg : FiberMessage, rest : AnyRef) =>
-            dequeued = msg :: Nil
-            @tailrec def go(rest : AnyRef) : FiberMessage = {
-              rest match {
-                case res : FiberMessage =>
-                  res
-                case (next : FiberMessage, nextRest : AnyRef) =>
-                  dequeued = next :: dequeued
-                  go(nextRest)
-              }
-            }
-            go(rest)
+
+  def addLocal(msg : FiberMessage): Unit = {
+    //adds by the fiber itself, these are basically racing with external adds,
+    //we can arbitrarily decide they're winning
+    pending = msg :: pending
+    nonEmptyHint = true
+  }
+
+  def poll() : FiberMessage = {
+    if(dequeued ne Nil) {
+      val res = dequeued.head
+      dequeued = dequeued.tail
+      res
+    } else {
+      val reversed = if(pending ne Nil) pending else this.getAndSet(Nil)
+      pending = Nil
+      nonEmptyHint = false
+      if(reversed eq Nil) {
+        null
+      } else {
+        @tailrec def go(rest: ::[FiberMessage]): FiberMessage = {
+          val t = rest.tail
+          if (t eq Nil)
+            rest.head
+          else {
+            dequeued = rest.head :: dequeued
+            nonEmptyHint = true
+            go(t.asInstanceOf[::[FiberMessage]])
+          }
         }
+
+        go(reversed.asInstanceOf[::[FiberMessage]])
+      }
     }
   }
 
 
+}
+
+object FiberInbox {
+  class Node(val msg : FiberMessage, var next : Node)
 }
