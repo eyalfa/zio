@@ -4,7 +4,6 @@ import java.util.concurrent.atomic.AtomicReference
 import scala.annotation.tailrec
 
 class FiberInbox extends AtomicReference[FiberInbox.MsgQueue](FiberInbox.MsgQueue.Nil) {
-  var dequeued : FiberInbox.MsgQueue = FiberInbox.MsgQueue.Nil
   var nonEmptyHint = false
 
   def isEmpty =
@@ -17,33 +16,22 @@ class FiberInbox extends AtomicReference[FiberInbox.MsgQueue](FiberInbox.MsgQueu
   }
 
   def addLocal(msg : FiberMessage): Unit = {
-    //adds by the fiber itself, these are basically racing with external adds,
-    //we can arbitrarily decide they're winning
-    dequeued = dequeued.enqueue(msg)
-    nonEmptyHint = true
+    add(msg)
   }
 
   def poll() : FiberMessage = {
-    this.getOpaque
-    if(!dequeued.isEmpty) {
-      val res = dequeued.head
-      dequeued = dequeued.tail
-      res
-    }
-    else if(this.get().isEmpty) {
-      nonEmptyHint = false
+    val curr = this.get()
+    if (curr.isEmpty)
       null
-    }
     else {
-      val read = this.getAndSet(FiberInbox.MsgQueue.Nil)
-      if(read.isEmpty) {
-        nonEmptyHint = false
-        null
-      } else {
-        dequeued = read.tail
-        nonEmptyHint = !dequeued.isEmpty
-        read.head
+      if(this.compareAndSet(curr, curr.tail)){
+        nonEmptyHint = !curr.tail.isEmpty
       }
+      else {
+        val updated = this.updateAndGet(_.tail)
+        nonEmptyHint = !updated.tail.isEmpty
+      }
+      curr.head
     }
   }
 }
