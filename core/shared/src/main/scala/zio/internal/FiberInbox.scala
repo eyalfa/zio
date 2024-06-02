@@ -3,16 +3,22 @@ package zio.internal
 import java.util.concurrent.atomic.AtomicReference
 import scala.annotation.tailrec
 
-class FiberInbox extends AtomicReference[FiberInbox.MsgQueue](FiberInbox.MsgQueue.Nil) {
-  var nonEmptyHint = false
+class FiberInbox extends AtomicReference[AnyRef](FiberInbox.MsgQueue.Nil) {
 
-  def isEmpty =
-    !nonEmptyHint &&
-      (this.get().isEmpty)
+  def isEmpty = {
+    val curr = this.get()
+    curr eq FiberInbox.MsgQueue.Nil
+  }
 
   def add(msg : FiberMessage): Unit = {
-    nonEmptyHint = true
-    this.getAndUpdate(_.enqueue(msg))
+    this.getAndUpdate{curr =>
+      if(curr eq FiberInbox.MsgQueue.Nil)
+        msg
+      else if(curr.isInstanceOf[FiberMessage])
+        FiberInbox.MsgQueue.Two(curr.asInstanceOf[FiberMessage], msg)
+      else
+        curr.asInstanceOf[FiberInbox.MsgQueue].enqueue(msg)
+    }
   }
 
   def addLocal(msg : FiberMessage): Unit = {
@@ -20,18 +26,29 @@ class FiberInbox extends AtomicReference[FiberInbox.MsgQueue](FiberInbox.MsgQueu
   }
 
   def poll() : FiberMessage = {
-    val curr = this.get()
-    if (curr.isEmpty)
+    val curr = this.getOpaque
+    if (curr eq FiberInbox.MsgQueue.Nil) //might be false negative, but a subsequent isEmpty will figure this out
       null
+    else if(curr.isInstanceOf[FiberMessage] &&
+      this.compareAndSet(curr, FiberInbox.MsgQueue.Nil)
+    )
+      curr.asInstanceOf[FiberMessage]
     else {
-      nonEmptyHint = !curr.tail.isEmpty
-      if(!this.compareAndSet(curr, curr.tail)) {
-        //curr.tail may be non empty, but in any case the CAS failures indicates another add
-        nonEmptyHint = true
-        this.updateAndGet(_.tail)
+      val curr2 = this.getAndUpdate{
+        case q : FiberInbox.MsgQueue =>
+          q.tail
+        case _ =>
+          FiberInbox.MsgQueue.Nil
       }
-      curr.head
+
+      if(curr2.isInstanceOf[FiberMessage])
+        curr2.asInstanceOf[FiberMessage]
+      else {
+        val currQ = curr2.asInstanceOf[FiberInbox.MsgQueue]
+        if(currQ.isEmpty) null else currQ.head
+      }
     }
+
   }
 }
 
