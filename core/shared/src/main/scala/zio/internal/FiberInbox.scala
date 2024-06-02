@@ -24,12 +24,11 @@ class FiberInbox extends AtomicReference[FiberInbox.MsgQueue](FiberInbox.MsgQueu
     if (curr.isEmpty)
       null
     else {
-      if(this.compareAndSet(curr, curr.tail)){
-        nonEmptyHint = !curr.tail.isEmpty
-      }
-      else {
-        val updated = this.updateAndGet(_.tail)
-        nonEmptyHint = !updated.tail.isEmpty
+      nonEmptyHint = !curr.tail.isEmpty
+      if(!this.compareAndSet(curr, curr.tail)) {
+        //curr.tail may be non empty, but in any case the CAS failures indicates another add
+        nonEmptyHint = true
+        this.updateAndGet(_.tail)
       }
       curr.head
     }
