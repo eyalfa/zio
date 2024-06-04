@@ -14,9 +14,9 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  *           "https://www.1024cores.net/home/lock-free-algorithms/queues/non-intrusive-mpsc-node-based-queue">
  *           Non-intrusive MPSC node-based queue</a> by D. Vyukov.
  */
-final public class Mailbox<A> implements Serializable {
+public class Mailbox<A> implements Serializable {
 
-	private transient Node read;
+	protected transient Node read;
 	@SuppressWarnings("unused")
 	private transient volatile Node write;
 
@@ -27,7 +27,7 @@ final public class Mailbox<A> implements Serializable {
 	/**
 	 * Adds the specified element to the queue.
 	 */
-	public void add(A data) {
+	final public void add(A data) {
 		Node next = new Node(data);
 		Node prev = WRITE.getAndSet(this, next);
 		NEXT.lazySet(prev, next);
@@ -37,7 +37,7 @@ final public class Mailbox<A> implements Serializable {
 	 * Returns {@code true} if the queue has no elements. Otherwise, returns
 	 * {@code false}.
 	 */
-	public boolean isEmpty() {
+	final public boolean isEmpty() {
 		return null == read.next;
 	}
 
@@ -45,7 +45,7 @@ final public class Mailbox<A> implements Serializable {
 	 * Returns {@code true} if the queue has elements. Otherwise, returns
 	 * {@code false}.
 	 */
-	public boolean nonEmpty() {
+	final public boolean nonEmpty() {
 		return null != read.next;
 	}
 
@@ -55,7 +55,7 @@ final public class Mailbox<A> implements Serializable {
 	 * 
 	 * @apiNote This method must be invoked by the single consumer (thread).
 	 */
-	public A poll() {
+	final public A poll() {
 		Node next = read.next;
 
 		if (next == null)
@@ -73,13 +73,18 @@ final public class Mailbox<A> implements Serializable {
 		volatile Node next;
 
 		Node(Object data) {
+			this(data, null);
+		}
+
+		Node(Object data, Node next) {
 			this.data = data;
+			this.next = next;
 		}
 	}
 
 	@SuppressWarnings("rawtypes")
 	private static final AtomicReferenceFieldUpdater<Mailbox, Node> WRITE = AtomicReferenceFieldUpdater
 			.newUpdater(Mailbox.class, Node.class, "write");
-	private static final AtomicReferenceFieldUpdater<Node, Node> NEXT = AtomicReferenceFieldUpdater
-			.newUpdater(Node.class, Node.class, "next");
+	static final AtomicReferenceFieldUpdater<Node, Node> NEXT = AtomicReferenceFieldUpdater.newUpdater(Node.class,
+			Node.class, "next");
 }

@@ -2,24 +2,24 @@ package zio.internal
 
 import zio.stacktracer.TracingImplicits.disableAutoTrace
 
-final class Mailbox[A] extends Serializable {
+class Mailbox[A] extends Serializable {
 
-  private[this] var read  = new Node(null)
+  protected var read      = new MailboxNode(null)
   private[this] var write = read
 
-  def add(data: A): Unit = {
-    val next = new Node(data.asInstanceOf[AnyRef])
+  final def add(data: A): Unit = {
+    val next = new MailboxNode(data.asInstanceOf[AnyRef])
     write.next = next
     write = next
   }
 
-  def isEmpty(): Boolean =
+  final def isEmpty(): Boolean =
     null == read.next
 
-  def nonEmpty(): Boolean =
+  final def nonEmpty(): Boolean =
     null != read.next
 
-  def poll(): A = {
+  final def poll(): A = {
     val next = read.next
 
     if (null == next)
@@ -32,6 +32,4 @@ final class Mailbox[A] extends Serializable {
   }
 }
 
-private class Node(var data: AnyRef) {
-  var next: Node = _
-}
+private[internal] class MailboxNode(var data: AnyRef, var next: MailboxNode = null)
