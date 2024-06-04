@@ -42,6 +42,47 @@ object MailboxSpec extends ZIOBaseSpec {
             actual <- consumer.join
           } yield assert(actual)(Assertion.equalTo(expected.toChunk))
         }
-      )
+      ),
+
+      suite("FiberMailbox") (
+        test("enqueue + prepends are visible to poll") {
+          val mailbox = new FiberMailbox
+          val m1 = FiberMessage.Resume(ZIO.succeed(1))
+          val m2 = FiberMessage.InterruptSignal(zio.Cause.empty)
+          val m3 = FiberMessage.Resume(ZIO.succeed(2))
+          mailbox.add(m1)
+          mailbox.add(m2)
+          mailbox.prepend2(FiberMessage.YieldNow, FiberMessage.resumeUnit)
+
+          val bldr = zio.Chunk.newBuilder[FiberMessage]
+          while(!mailbox.isEmpty) {
+            val m = mailbox.poll()
+            bldr += m
+          }
+          val polled = bldr.result()
+          mailbox.add(m3)
+          assert(mailbox.nonEmpty())(Assertion.isTrue)  &&
+          assert(polled)(Assertion.equalTo(zio.Chunk(FiberMessage.YieldNow, FiberMessage.resumeUnit, null, m1, m2)))
+        }
+      ),
+      test("prepends + enqueue are visible to poll") {
+        val mailbox = new FiberMailbox
+        val m1 = FiberMessage.Resume(ZIO.succeed(1))
+        val m2 = FiberMessage.InterruptSignal(zio.Cause.empty)
+        val m3 = FiberMessage.Resume(ZIO.succeed(2))
+        mailbox.prepend2(FiberMessage.YieldNow, FiberMessage.resumeUnit)
+        mailbox.add(m1)
+        mailbox.add(m2)
+
+        val bldr = zio.Chunk.newBuilder[FiberMessage]
+        while(!mailbox.isEmpty) {
+          val m = mailbox.poll()
+          bldr += m
+        }
+        val polled = bldr.result()
+        mailbox.add(m3)
+        assert(mailbox.nonEmpty())(Assertion.isTrue)  &&
+          assert(polled)(Assertion.equalTo(zio.Chunk(FiberMessage.YieldNow, FiberMessage.resumeUnit, null, m1, m2)))
+      }
     )
 }

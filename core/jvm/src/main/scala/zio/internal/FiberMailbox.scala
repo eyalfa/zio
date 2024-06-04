@@ -3,27 +3,17 @@ package zio.internal
 class FiberMailbox extends Mailbox[FiberMessage] {
 
   def prepend1(m1: FiberMessage): Unit = {
-    val NEXT  = Mailbox.NEXT
-    val read  = this.read
-    val next  = read.next
-    val node1 = new Mailbox.Node(m1, next)
-
-    if (NEXT.compareAndSet(read, next, node1)) return
-
-    NEXT.lazySet(node1, read.next)
-    NEXT.lazySet(read, node1)
+    //notice we MUST keep this.read even if its empty, this is required in order to make future adds visible to the reader
+    //this results later with isEmpty=false and poll=null, subsequent poll and is ready picks up the rest of the queue (or 'future' adds to the inbox)
+    read = new Mailbox.Node(null,
+      new Mailbox.Node(m1, this.read))
   }
 
   def prepend2(m1: FiberMessage, m2: FiberMessage): Unit = {
-    val NEXT  = Mailbox.NEXT
-    val read  = this.read
-    val next  = read.next
-    val node2 = new Mailbox.Node(m2, next)
-    val node1 = new Mailbox.Node(m1, node2)
-
-    if (NEXT.compareAndSet(read, next, node1)) return
-
-    NEXT.lazySet(node2, read.next)
-    NEXT.lazySet(read, node1)
+    //see comment in prepend1
+    read = new Mailbox.Node(null,
+      new Mailbox.Node(m1,
+        new Mailbox.Node(m2, read)
+      ))
   }
 }
