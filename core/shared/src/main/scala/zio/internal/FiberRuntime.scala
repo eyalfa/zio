@@ -137,6 +137,14 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
       ZIO.unit
     }
 
+  //todo: refactor this
+  override def interrupt(implicit trace: Trace): UIO[Exit[E, A]] = ZIO.suspendSucceed {
+    if (isAlive())
+      super.interrupt(trace)
+    else
+      zio.Exit.succeed(_exitValue)
+  }
+
   def location: Trace = fiberId.location
 
   def poll(implicit trace: Trace): UIO[Option[Exit[E, A]]] =
