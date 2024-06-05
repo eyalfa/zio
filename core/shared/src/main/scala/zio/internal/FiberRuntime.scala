@@ -127,10 +127,14 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
     }
 
   def interruptAsFork(fiberId: FiberId)(implicit trace: Trace): UIO[Unit] =
-    ZIO.succeed {
-      val cause = Cause.interrupt(fiberId).traced(StackTrace(self.fiberId, Chunk.single(trace)))
+    ZIO.suspendSucceed {
+      if(_exitValue eq null) {
 
-      tell(FiberMessage.InterruptSignal(cause))
+        val cause = Cause.interrupt(fiberId).traced(StackTrace(self.fiberId, Chunk.single(trace)))
+
+        tell(FiberMessage.InterruptSignal(cause))
+      }
+      ZIO.unit
     }
 
   def location: Trace = fiberId.location
@@ -1423,8 +1427,10 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
   private[zio] def tellAddChildren(children: Iterable[Fiber.Runtime[_, _]]): Unit =
     tell(FiberMessage.Stateful(parentFiber => parentFiber.addChildren(children)))
 
-  private[zio] def tellInterrupt(cause: Cause[Nothing]): Unit =
-    tell(FiberMessage.InterruptSignal(cause))
+  private[zio] def tellInterrupt(cause: Cause[Nothing]): Unit = {
+    if(isAlive())
+      tell(FiberMessage.InterruptSignal(cause))
+  }
 
   /**
    * Transfers all children of this fiber that are currently running to the

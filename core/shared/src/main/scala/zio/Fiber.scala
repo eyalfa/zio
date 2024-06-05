@@ -165,7 +165,7 @@ abstract class Fiber[+E, +A] { self =>
    * @return
    *   `UIO[Exit, E, A]]`
    */
-  final def interrupt(implicit trace: Trace): UIO[Exit[E, A]] =
+  /*final*/ def interrupt(implicit trace: Trace): UIO[Exit[E, A]] =
     ZIO.fiberIdWith(fiberId => self.interruptAs(fiberId))
 
   /**
