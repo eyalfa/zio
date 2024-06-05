@@ -65,6 +65,8 @@ public class Mailbox<A> implements Serializable {
 		A data = (A) next.data;
 		next.data = null;
 		this.read = next;
+		if(data == null)
+			return poll();
 		return data;
 	}
 
