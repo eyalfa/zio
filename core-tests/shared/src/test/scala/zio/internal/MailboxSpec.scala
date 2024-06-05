@@ -62,7 +62,7 @@ object MailboxSpec extends ZIOBaseSpec {
           val polled = bldr.result()
           mailbox.add(m3)
           assert(mailbox.nonEmpty())(Assertion.isTrue)  &&
-          assert(polled)(Assertion.equalTo(zio.Chunk(FiberMessage.YieldNow, FiberMessage.resumeUnit, null, m1, m2)))
+          assert(polled)(Assertion.equalTo(zio.Chunk(FiberMessage.YieldNow, FiberMessage.resumeUnit, m1, m2)))
         }
       ),
       test("prepends + enqueue are visible to poll") {
@@ -82,7 +82,7 @@ object MailboxSpec extends ZIOBaseSpec {
         val polled = bldr.result()
         mailbox.add(m3)
         assert(mailbox.nonEmpty())(Assertion.isTrue)  &&
-          assert(polled)(Assertion.equalTo(zio.Chunk(FiberMessage.YieldNow, FiberMessage.resumeUnit, null, m1, m2)))
+          assert(polled)(Assertion.equalTo(zio.Chunk(FiberMessage.YieldNow, FiberMessage.resumeUnit, m1, m2)))
       }
     )
 }
