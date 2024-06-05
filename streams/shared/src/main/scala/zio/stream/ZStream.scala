@@ -1972,6 +1972,18 @@ final class ZStream[-R, +E, +A] private (val channel: ZChannel[R, Any, Any, Any,
       .concatMap(ZChannel.writeChunk(_))
       .mapOutZIOParUnordered[R1, E1, Chunk[A2]](n, bufferSize)(a => f(a).map(Chunk.single(_)))
       .toStream
+  /*val channels: ZChannel[R, Any, Any, Any, E, ZChannel[R1, Any, Any, Any, E1, Chunk[A2], Unit], Any] = self
+      .toChannel
+      .concatMap { chunk =>
+        ZChannel.writeChunk{
+          chunk
+            .map { a =>
+              ZChannel.fromZIO(f(a)).flatMap(a2 => ZChannel.write(Chunk.single(a2)))
+            }
+        }
+      }
+    val resChannel: ZChannel[R1, Any, Any, Any, E1, Chunk[A2], Any] = ZChannel.mergeAll(channels, n, bufferSize, ZChannel.MergeStrategy.BackPressure)
+    resChannel.toStream*/
 
   /**
    * Merges this stream and the specified stream together.
@@ -1982,8 +1994,23 @@ final class ZStream[-R, +E, +A] private (val channel: ZChannel[R, Any, Any, Any,
   def merge[R1 <: R, E1 >: E, A1 >: A](
     that: => ZStream[R1, E1, A1],
     strategy: => HaltStrategy = HaltStrategy.Both
-  )(implicit trace: Trace): ZStream[R1, E1, A1] =
-    self.mergeWith[R1, E1, A1, A1](that, strategy)(identity, identity) // TODO: Dotty doesn't infer this properly
+  )(implicit trace: Trace): ZStream[R1, E1, A1] = {
+    import HaltStrategy.{Either, Left, Right}
+
+    def handler(terminate: Boolean)(exit: Exit[E1, Any]): ZChannel.MergeDecision[R1, E1, Any, E1, Any] =
+      if (terminate || !exit.isSuccess) ZChannel.MergeDecision.done(ZIO.done(exit))
+      else ZChannel.MergeDecision.await(ZIO.done(_))
+
+    new ZStream(
+      ZChannel.succeed(strategy).flatMap { strategy =>
+        self.channel
+          .mergeWith(that.channel)(
+            handler(strategy == Either || strategy == Left),
+            handler(strategy == Either || strategy == Right)
+          )
+      }
+    )
+  }
 
   /**
    * Merges this stream and the specified stream together. New produced stream
@@ -2188,25 +2215,10 @@ final class ZStream[-R, +E, +A] private (val channel: ZChannel[R, Any, Any, Any,
   def mergeWith[R1 <: R, E1 >: E, A2, A3](
     that: => ZStream[R1, E1, A2],
     strategy: => HaltStrategy = HaltStrategy.Both
-  )(l: A => A3, r: A2 => A3)(implicit trace: Trace): ZStream[R1, E1, A3] = {
-    import HaltStrategy.{Either, Left, Right}
-
-    def handler(terminate: Boolean)(exit: Exit[E1, Any]): ZChannel.MergeDecision[R1, E1, Any, E1, Any] =
-      if (terminate || !exit.isSuccess) ZChannel.MergeDecision.done(ZIO.done(exit))
-      else ZChannel.MergeDecision.await(ZIO.done(_))
-
-    new ZStream(
-      ZChannel.succeed(strategy).flatMap { strategy =>
-        self
-          .map(l)
-          .channel
-          .mergeWith(that.map(r).channel)(
-            handler(strategy == Either || strategy == Left),
-            handler(strategy == Either || strategy == Right)
-          )
-      }
-    )
-  }
+  )(l: A => A3, r: A2 => A3)(implicit trace: Trace): ZStream[R1, E1, A3] =
+    self
+      .map(l)
+      .merge(that.map(r), strategy)
 
   /**
    * Runs the specified effect if this stream fails, providing the error to the
@@ -3362,7 +3374,12 @@ final class ZStream[-R, +E, +A] private (val channel: ZChannel[R, Any, Any, Any,
   def timeout(d: => Duration)(implicit trace: Trace): ZStream[R, E, A] =
     ZStream.succeed(d).flatMap { d =>
       ZStream.fromPull[R, E, A] {
-        self.toPull.map(pull => pull.timeoutFail(None)(d))
+        self.toPull.map { pull =>
+          // None case on the error channel of pull indicates completion/done.
+          // Move it to success channel before calling timeout effect so that it does not log completion as failure.
+          // In the end, move None case back to error channel for further stream processing
+          pull.unsome.timeoutTo(None)(identity)(d).some
+        }
       }
     }
 
@@ -3384,7 +3401,12 @@ final class ZStream[-R, +E, +A] private (val channel: ZChannel[R, Any, Any, Any,
   )(d: => Duration)(implicit trace: Trace): ZStream[R, E1, A] =
     ZStream.succeed((cause, d)).flatMap { case (cause, d) =>
       ZStream.fromPull[R, E1, A] {
-        self.toPull.map(pull => pull.timeoutFailCause(cause.map(Some(_)))(d))
+        self.toPull.map { pull =>
+          // None case on the error channel of pull indicates completion/done.
+          // Move it to success channel before calling timeout effect so that it does not log completion as failure.
+          // In the end, move None case back to error channel for further stream processing
+          pull.unsome.timeoutFailCause(cause)(d).some
+        }
       }
     }
 
