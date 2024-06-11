@@ -1,6 +1,7 @@
 package zio.internal;
 
 import java.io.Serializable;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 /**
@@ -30,7 +31,8 @@ public class Mailbox<A> implements Serializable {
 	final public void add(A data) {
 		Node next = new Node(data);
 		Node prev = WRITE.getAndSet(this, next);
-		NEXT.lazySet(prev, next);
+		//NEXT.lazySet(prev, next);
+		prev.lazySetNext(next);
 	}
 
 	/**
@@ -38,7 +40,7 @@ public class Mailbox<A> implements Serializable {
 	 * {@code false}.
 	 */
 	final public boolean isEmpty() {
-		return null == read.next;
+		return null == read.getNext();
 	}
 
 	/**
@@ -46,7 +48,7 @@ public class Mailbox<A> implements Serializable {
 	 * {@code false}.
 	 */
 	final public boolean nonEmpty() {
-		return null != read.next;
+		return null != read.getNext();
 	}
 
 	/**
@@ -56,7 +58,7 @@ public class Mailbox<A> implements Serializable {
 	 * @apiNote This method must be invoked by the single consumer (thread).
 	 */
 	final public A poll() {
-		Node next = read.next;
+		Node next = read.plainGetNext();
 
 		if (next == null)
 			return null;
@@ -70,23 +72,36 @@ public class Mailbox<A> implements Serializable {
 		return data;
 	}
 
-	static class Node {
+	static class Node extends AtomicReference<Node> {
 		Object data;
-		volatile Node next;
+		//volatile Node next;
 
 		Node(Object data) {
 			this(data, null);
 		}
 
 		Node(Object data, Node next) {
+			super(next);
 			this.data = data;
-			this.next = next;
+			//this.next = next;
+		}
+
+		void lazySetNext(Node next) {
+			this.lazySet(next);
+		}
+
+		Node getNext() {
+			return this.get();
+		}
+
+		Node plainGetNext() {
+			return this.getPlain();
 		}
 	}
 
 	@SuppressWarnings("rawtypes")
 	private static final AtomicReferenceFieldUpdater<Mailbox, Node> WRITE = AtomicReferenceFieldUpdater
 			.newUpdater(Mailbox.class, Node.class, "write");
-	static final AtomicReferenceFieldUpdater<Node, Node> NEXT = AtomicReferenceFieldUpdater.newUpdater(Node.class,
-			Node.class, "next");
+	/*static final AtomicReferenceFieldUpdater<Node, Node> NEXT = AtomicReferenceFieldUpdater.newUpdater(Node.class,
+			Node.class, "next");*/
 }
