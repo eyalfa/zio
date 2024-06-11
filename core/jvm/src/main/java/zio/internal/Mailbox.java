@@ -15,14 +15,16 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  *           "https://www.1024cores.net/home/lock-free-algorithms/queues/non-intrusive-mpsc-node-based-queue">
  *           Non-intrusive MPSC node-based queue</a> by D. Vyukov.
  */
-public class Mailbox<A> implements Serializable {
+public class Mailbox<A> extends /*PaddedBase*/ AtomicReference<Mailbox.Node> {
 
 	protected transient Node read;
-	@SuppressWarnings("unused")
-	private transient volatile Node write;
 
+	/*@SuppressWarnings("unused")
+	private transient volatile Node write;
+*/
 	public Mailbox() {
-		this.read = this.write = new Node(null);
+		this.read = new Node(null);
+		this.set(read);
 	}
 
 	/**
@@ -30,7 +32,8 @@ public class Mailbox<A> implements Serializable {
 	 */
 	final public void add(A data) {
 		Node next = new Node(data);
-		Node prev = WRITE.getAndSet(this, next);
+		Node prev = //WRITE.getAndSet(this, next);
+				getAndSet(next);
 		//NEXT.lazySet(prev, next);
 		prev.lazySetNext(next);
 	}
@@ -99,9 +102,13 @@ public class Mailbox<A> implements Serializable {
 		}
 	}
 
-	@SuppressWarnings("rawtypes")
+	/*@SuppressWarnings("rawtypes")
 	private static final AtomicReferenceFieldUpdater<Mailbox, Node> WRITE = AtomicReferenceFieldUpdater
 			.newUpdater(Mailbox.class, Node.class, "write");
-	/*static final AtomicReferenceFieldUpdater<Node, Node> NEXT = AtomicReferenceFieldUpdater.newUpdater(Node.class,
+	static final AtomicReferenceFieldUpdater<Node, Node> NEXT = AtomicReferenceFieldUpdater.newUpdater(Node.class,
 			Node.class, "next");*/
+}
+
+class PaddedBase extends AtomicReference<Mailbox.Node> {
+	protected long pad0, pad1, pad2, pad3, pad4, pad5, pad6, pad7, pad8, pad9, pad10, pad11, pad12, pad13, pad14, pad15;
 }
