@@ -5571,6 +5571,7 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
                   Left(ZIO.unit)
                 } //todo: can we bypass here? it'd require the scheduler to change state into BypassPendingResult and adding a state so the scheduler does the right thing for 'late' timeout
               else {
+                var wasCancelled = false
                 fib.addObserver { ex =>
                   cancellable.apply()
                   if (!bypassState.compareAndSet(BypassPossible, BypassPendingResult(ex))) {
@@ -5578,6 +5579,7 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
                     //in either case the state is BypassDenied and we're in race with the scheduler, and we know for sure this entire effect will be completed via cb.
                     //since cb CAN be invoked multiple times, we simply delegate the race to cb
                     // * notice that changing the scheduler to use bypass as well will require modifying this logic as state may be BypassPendingResult, violating the assumption behind this logic.
+                    wasCancelled = true
                     cb {
                       (fib.inheritAll.as(Right(ex)))
                     }
@@ -5605,20 +5607,15 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
                     }
                   case ex =>
                     //fiber completed while running on current thread.
-                    // if ex is interrupted we must check if it's due to the scheduler winning the race
-                    if(ex.isInterrupted) {
-                      //at this point no one's updating state
-                      if(bypassState.get() eq BypassDenied) {
-                        //scheduler won, cb is already invoked, we have no cancellation action
-                        Left(ZIO.unit)
-                      }
-                      else {
-                        Right(fib.inheritAll.as(Right(ex)))
-                      }
-                    }
-                    else {
+                    // thing is, scheduler may have managed to slip in and invoke cb
+                    // we can determine this by examining the wasCancelled var,
+                    // this var was updated by the fiber while running on this thread, so it's safe to read
+                    if(wasCancelled )
+                      //scheduler already won (notice the fiber does not attempt to set the state to BypassDenied), so cb is already invoked and we don't even have a cancellation action to provide
+                      Left(ZIO.unit)
+                    else
+                      //fiber won, scheduler already cancelled
                       Right(fib.inheritAll.as(Right(ex)))
-                    }
                 }
               }
             }
