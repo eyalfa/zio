@@ -5572,28 +5572,20 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
                 } //todo: can we bypass here? it'd require the scheduler to change state into BypassPendingResult and adding a state so the scheduler does the right thing for 'late' timeout
               else {
                 fib.addObserver { ex =>
+                  cancellable.apply()
                   if (!bypassState.compareAndSet(BypassPossible, BypassPendingResult(ex))) {
                     //lost the race, either to parent fiber or to the scheduler
                     //in either case the state is BypassDenied and we're in race with the scheduler, and we know for sure this entire effect will be completed via cb.
                     //since cb CAN be invoked multiple times, we simply delegate the race to cb
                     // * notice that changing the scheduler to use bypass as well will require modifying this logic as state may be BypassPendingResult, violating the assumption behind this logic.
-                    cancellable.apply()
                     cb {
                       (fib.inheritAll.as(Right(ex)))
                     }
                   } //else: fiber won, parent now owns cb and can bypass it
                 }(zio.Unsafe.unsafe)
-                fib.start(self)
-
-                bypassState.get() match {
-                  case BypassPendingResult(ex) =>
-                    //early fiber exit
-                    cancellable.apply()
-                    Right(fib.inheritAll.as(Right(ex)))
-                  case BypassDenied =>
-                    //scheduler already won, so cb is already invoked and we don't even have a cancellation action to provide
-                    Left(ZIO.unit)
-                  case BypassPossible =>
+                fib.start(self) match {
+                  case null =>
+                    //fiber is still running, need to check state
                     if (bypassState.compareAndSet(BypassPossible, BypassDenied)) {
                       Left(
                         ZIO.succeed(cancellable.apply())
@@ -5604,13 +5596,28 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
                       //furthermore, this is the final state (no loop required)
                       bypassState.get /*Plain*/ () match { //the CAS already read the value, since we lost the CAS we also know state will no longer change (the nature of the STM)
                         case BypassPendingResult(ex) =>
-                          //early fiber exit
-                          cancellable.apply()
+                          //semi late early fiber exit, scheduler already cancelled
                           Right(fib.inheritAll.as(Right(ex)))
                         case BypassDenied =>
                           //scheduler already won (notice the fiber does not attempt to set the state to BypassDenied), so cb is already invoked and we don't even have a cancellation action to provide
                           Left(ZIO.unit)
                       }
+                    }
+                  case ex =>
+                    //fiber completed while running on current thread.
+                    // if ex is interrupted we must check if it's due to the scheduler winning the race
+                    if(ex.isInterrupted) {
+                      //at this point no one's updating state
+                      if(bypassState.get() eq BypassDenied) {
+                        //scheduler won, cb is already invoked, we have no cancellation action
+                        Left(ZIO.unit)
+                      }
+                      else {
+                        Right(fib.inheritAll.as(Right(ex)))
+                      }
+                    }
+                    else {
+                      Right(fib.inheritAll.as(Right(ex)))
                     }
                 }
               }
