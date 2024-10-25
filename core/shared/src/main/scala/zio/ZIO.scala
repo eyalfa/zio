@@ -5581,6 +5581,7 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
                   case null =>
                     fib.unsafe.addObserver { ex =>
                       if(cbFired.compareAndSet(false, true))
+                        cancellable.apply()
                         cb {
                           (fib.inheritAll.as(Right(ex)))
                         }
@@ -5590,11 +5591,9 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
                     ) //todo: interrupt fib? it'd be interrupted anyway as a child fiber
                   case ex =>
                     //we have an exit value, but we're not sure yet if we can use it since the scheduler may have won the race.
-                    //so first we try to cancel the scheduler, this should give us a better chance to win the race (if we haven't already lost)
-                    if(cancellable.apply())
-                      Right(fib.inheritAll.as(Right(ex)))
-                    //figure out if we won or lost
-                    else if(cbFired.compareAndSet(false, true)) {
+                    //so first we try to cancel the scheduler, this should give us a better chance to win the race (if we haven't already lost), then check cbFired
+                    cancellable.apply()
+                    if(cbFired.compareAndSet(false, true)) {
                       //notice that winning the CAS above means the fiber was NOT interrupted by the scheduler,
                       // hence there's no chance ex is the result of such interruption
                       Right(fib.inheritAll.as(Right(ex)))
