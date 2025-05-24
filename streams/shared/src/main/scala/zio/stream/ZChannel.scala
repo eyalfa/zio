@@ -6,8 +6,11 @@ import zio.stacktracer.TracingImplicits.disableAutoTrace
 import zio.stream.internal.ChannelExecutor.ChannelState
 import zio.stream.internal.{AsyncInputConsumer, AsyncInputProducer, ChannelExecutor, SingleProducerAsyncInput}
 
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
 import scala.annotation.tailrec
+import scala.collection.mutable.ListBuffer
+import scala.jdk.CollectionConverters.{IterableHasAsScala, IteratorHasAsScala, SeqHasAsJava}
 
 /**
  * A `ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone]` is a nexus
@@ -2486,196 +2489,48 @@ object ZChannel {
       self.provideSomeEnvironment(_.updateAt(key)(f))
   }
 
+  class FiberList {
+    implicit val unsafe = zio.Unsafe
 
-  
+    val deque = new ConcurrentLinkedDeque[Fiber.Runtime[Any, Any]]()
 
-  /*private[streams] */class FiberListNode(
-    var fib : Fiber.Runtime[Any, Any],
-    prev_ : FiberListNode,
-    next_ : FiberListNode) {
-    import FiberListNode.unsafe
-
-    val next = zio.Ref.unsafe.make(next_)
-    val prev = zio.Ref.unsafe.make(prev_)
-
-    def unlink = {
-      fib = null
-      @tailrec def go(p : FiberListNode, n : FiberListNode) : Unit = {
-        if(null ne p) {
-          p.next.unsafe.update{ pn =>
-            if(pn eq this)
-              n
-            else
-              pn
-          }
+    private def addForked(fib : Fiber.Runtime[Any, Any]) : Unit = {
+      deque.offerFirst(fib)
+      val itr = deque.iterator()
+      fib.unsafe.addObserver{_ =>
+        itr.next() match {
+          case `fib` =>
+            itr.remove()
+          case other =>
+            //unexpected in the case of a single forker, can be relaxed to support multiple forkers
+            assert(null eq other)
         }
-        if(null ne n) {
-          n.prev.unsafe.update{np =>
-            if(np eq this)
-              p
-            else
-              np
-          }
-        }
-        //se if this's links were updated by neighbours during unlinking
-        val p1 = prev.unsafe.get
-        val n1 = next.unsafe.get
-        if((p1 ne p) || (n1 ne n))
-          go(p1, n1)
-      }
-      go(prev.unsafe.get, next.unsafe.get)
-    }
-
-    def isAlive : Boolean = {
-      val f = fib
-      (f ne null) && f.unsafe.poll.isEmpty
-    }
-
-    def finalizeAppend(n0 : FiberListNode) = {
-      if(n0 ne null) {
-        //no race here since n0.prev was null (no left neighbour)
-        n0.prev.unsafe.set(this)
-        //if n0 is still alive the condition evals to false and we stayed linked with n0
-        //otherwise:
-        //it may have already unlinked itself, in this case the unlink below doesn't race with anything
-        //it may still be running unlink, which can cope with a concurrent unlink
-        if(!n0.isAlive)
-          n0.unlink //may race with n0 unlinking itself
       }
     }
-  }
-
-  /*private[streams]*/ class FiberList {
-    import FiberListNode.unsafe
-
-    var head = null.asInstanceOf[FiberListNode]
-      //zio.Ref.unsafe.make(null.asInstanceOf[FiberListNode])
-
 
     def forkInList[R, E, A](z : ZIO[R, E, A])(implicit trace : Trace) : URIO[R, Fiber.Runtime[E, A]] = {
-      //ZIO.uninterruptibleMask{ restore =>
-        ZIO.withFiberRuntime[R, Nothing, Fiber.Runtime[E, A]]{ case (parentFiber, parentStatus) =>
-          val actualFork = ZIO.succeed {
-            //notice no effects at this point, so once we got into this scope we're 'interrupt free'
-            val unstartedFib = ZIO.unsafe.makeChildFiber(trace, z, parentFiber, parentStatus.runtimeFlags, global)
-            //assumption one fiber performing ALL forks
-            val newHead = new FiberListNode(unstartedFib, null, head)
-            unstartedFib.unsafe.addObserver { _ =>
-              newHead.unlink
-            }
-            //assumption: one forking fiber, hence no race with other forks
-            if (head ne null) {
-              //in case head is already finished it'd be unlinked
-              newHead.finalizeAppend(head)
-            }
-            head = newHead
-            //todo: yield logic...
-            unstartedFib.startConcurrently(z)
-            unstartedFib
-          }
-          if(parentFiber.shouldYieldBeforeFork())
-            ZIO.yieldNow *> actualFork
-          else
-            actualFork
-        }
-      //}
-    }
-
-    //assumption: forker is already interrupted at this point
-    def close()(implicit trace : Trace) : UIO[Unit] = {
-      def iterator_(h : FiberListNode) = new Iterator[Fiber.Runtime[Any, Any]] {
-        var curr : Fiber.Runtime[Any, Any] = null
-        var currNode = h
-
-        override def hasNext: Boolean = {
-          (curr ne null)  ||
-            findNext()
-        }
-
-        @tailrec private def findNext() : Boolean = {
-          (null ne currNode) && {
-            curr = currNode.fib
-            ((curr ne null) && curr.unsafe.poll.isEmpty)  || {
-              curr = null
-              currNode = currNode.next.unsafe.get
-              findNext()
-            }
-          }
-        }
-
-        override def next(): Fiber.Runtime[Any, Any] = {
-          val res = curr
-          curr = null
-          currNode = currNode.next.unsafe.get
-          res
-        } //assumption: called only after a successful hasNext
-      }
-
-      ZIO.fiberIdWith { fibId =>
-        val h = head
-        head = null
-
-        val c = zio.Cause.interrupt(fibId)
-
-        val b = iterator_(h)
-          .foldLeft(false) {case (acc, fib) =>
-            if((fib.id != fibId) && fib.unsafe.poll.isEmpty) {
-              fib.unsafe.interrupt(c)
-              true
-            } else
-              acc
-          }
-        if(!b) ZIO.unit else {
-          val iterable = new Iterable[Fiber.Runtime[Any, Any]] {
-            override def iterator: Iterator[Fiber.Runtime[Any, Any]] = iterator_(h)
-          }
-          ZIO.foreachDiscard(iterable){fib =>
-            fib.await.unless(fib.id == fibId)
-          }
-        }
-      }
-
-    }
-
-  }
-
-  /*private[streams]*/ object FiberListNode {
-    implicit def unsafe: Unsafe = zio.Unsafe
-
-    /*def forkIntoList[R, E, A](currHead : FiberListNode)(z : ZIO[R, E, A])(implicit trace : Trace) = {
-      assert ((currHead eq null) || (currHead.prev.unsafe.get eq null))
-      ZIO.uninterruptibleMask{ restore =>
-        ZIO.withFiberRuntime{ case (parentFiber, parentStatus) =>
-          val newNode = new FiberListNode(null, null, currHead)
-          val z1 = restore(z).ensuring{
-            newNode.unlink
-            zio.Exit.unit
-          }
+      ZIO.withFiberRuntime[R, Nothing, Fiber.Runtime[E, A]]{ case (parentFiber, parentStatus) =>
+        val actualFork = ZIO.succeed {
+          //notice no effects at this point, so once we got into this scope we're 'interrupt free'
           val unstartedFib = ZIO.unsafe.makeChildFiber(trace, z, parentFiber, parentStatus.runtimeFlags, global)
-          newNode.fib = unstartedFib
+          addForked(unstartedFib)
 
+          unstartedFib.startConcurrently(z)
+          unstartedFib
         }
 
-          //if (parentFiber.shouldYieldBeforeFork()) ZIO.yieldNow *> f else f
+        if(parentFiber.shouldYieldBeforeFork())
+          ZIO.yieldNow *> actualFork
+        else
+          actualFork
       }
     }
 
-
-    def prepend(currHead : FiberListNode, fib : Fiber.Runtime[Any, Any]) : FiberListNode = {
-      if(fib.unsafe.poll.nonEmpty)
-        currHead
-      else {
-        val res = new FiberListNode(fib, null, currHead)
-        if(currHead ne null) {
-          currHead.prev.unsafe.set(res)
-          if(currHead.fib eq null) {
-            //this is tricky since the currHead fiber may have unlinked before seeing the new prev, hence its tail's prev may be pointing to null
-            //further more the new fiber may have already terminated
-          }
-        }
+    def close()(implicit trace : Trace) : UIO[Unit] = {
+      ZIO.fiberIdWith { fibId =>
+        zio.Fiber.interruptAllAs(fibId)(deque.asScala.filter(fib => (fib.id != fibId) && fib.isAlive()))
       }
-
-    }*/
+    }
   }
 
 }
