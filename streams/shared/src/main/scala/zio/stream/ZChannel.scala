@@ -830,8 +830,9 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
         permits     <- Semaphore.make(n.toLong)
         failure      = Ref.unsafe.make[Cause[OutErr1]](Cause.empty)(Unsafe)
         pull        <- (queueReader >>> self).toPullInAlt(scope)
-        childScope  <- scope.fork
-        fibersList <- ZIO.acquireRelease(ZIO.succeed(new ZChannel.FiberList))(_.close()).provideEnvironment(ZEnvironment(childScope))
+        //childScope  <- scope.fork
+        //fibersList <- ZIO.acquireRelease(ZIO.succeed(new ZChannel.FiberList))(_.close()).provideEnvironment(ZEnvironment(childScope))
+        fibersList  =  new ZChannel.FiberList
         fiberId     <- ZIO.fiberId
         _ <-
           pull.flatMap { outElem =>
@@ -867,7 +868,9 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
                   outgoing.offer(ZChannel.failLeftUnit)
             })
             .ignore
-            .raceFirst(ZChannel.awaitErrorSignal(childScope, fiberId)(errorSignal))
+            .ensuring(fibersList.close())
+            //.raceFirst(ZChannel.awaitErrorSignal(childScope, fiberId)(errorSignal))
+            .raceFirst(errorSignal.await.interruptible)
             .forkIn(scope)
       } yield {
         lazy val writer: ZChannel[Env1, Any, Any, Any, OutErr1, OutElem2, OutDone] =
