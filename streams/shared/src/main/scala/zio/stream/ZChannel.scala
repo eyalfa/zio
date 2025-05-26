@@ -830,12 +830,11 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
         fiberId     <- ZIO.fiberId
         _ <-
           pull.flatMap { outElem =>
-            val latch = Promise.unsafe.make[Nothing, Unit](fiberId)(Unsafe)
             for {
               _ <- fibersList.forkInList {
                 permits
                   .withPermit(
-                    latch.succeedUnit *> f(outElem)
+                    f(outElem)
                       .foldCauseZIO(
                         cause =>
                           failure.update(_ && cause).unless(cause.isInterruptedOnly) *>
@@ -845,9 +844,7 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
                       )
                   )
                   .interruptible
-                //.forkIn(childScope)
               }
-              _ <- latch.await
             } yield ()
           }.forever.interruptible
             .onError(_.failureOrCause match {
@@ -855,8 +852,13 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
                 failure.update(_ && Cause.fail(x.value)) *>
                   outgoing.offer(ZChannel.failLeftUnit)
               case Left(x: Right[OutErr, OutDone]) =>
-                permits.withPermits(n.toLong)(ZIO.unit).interruptible *>
-                  outgoing.offer(Exit.fail(x.asInstanceOf[Either[Unit, OutDone]]))
+                ZIO.fiberIdWith{currFibId =>
+                  Fiber
+                    .collectAllDiscard(fibersList.view(currFibId))
+                    .await
+                }
+                .interruptible  *>
+                outgoing.offer(Exit.fail(x.asInstanceOf[Either[Unit, OutDone]]))
               case Right(cause) =>
                 failure.update(_ && cause).unless(cause.isInterruptedOnly) *>
                   outgoing.offer(ZChannel.failLeftUnit)
