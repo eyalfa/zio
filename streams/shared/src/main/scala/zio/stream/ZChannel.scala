@@ -2,7 +2,7 @@ package zio.stream
 
 import zio.internal.{FiberRuntime, FiberScope}
 import zio.internal.FiberScope.global
-import zio.{ZIO, _}
+import zio.{FiberId, ZIO, _}
 import zio.stacktracer.TracingImplicits.disableAutoTrace
 import zio.stream.internal.ChannelExecutor.ChannelState
 import zio.stream.internal.{AsyncInputConsumer, AsyncInputProducer, ChannelExecutor, SingleProducerAsyncInput}
@@ -821,53 +821,57 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
         outgoing    <- Queue.bounded[Exit[Either[Unit, OutDone], OutElem2]](bufferSize)
         _           <- scope.addFinalizer(outgoing.shutdown)
         errorSignal <- Promise.make[Nothing, Unit]
-        permits     <- Semaphore.make(n.toLong)
         failure      = Ref.unsafe.make[Cause[OutErr1]](Cause.empty)(Unsafe)
         pull        <- (queueReader >>> self).toPullInAlt(scope)
         //childScope  <- scope.fork
         //fibersList <- ZIO.acquireRelease(ZIO.succeed(new ZChannel.FiberList))(_.close()).provideEnvironment(ZEnvironment(childScope))
         fibersList  =  new ZChannel.FiberList
+        sem = new ZChannel.SingleConsumerSemaphore(n)
         fiberId     <- ZIO.fiberId
-        _ <-
-          pull.flatMap { outElem =>
-            for {
-              _ <- fibersList.forkInList {
-                permits
-                  .withPermit(
-                    f(outElem)
-                      .foldCauseZIO(
-                        cause =>
-                          failure.update(_ && cause).unless(cause.isInterruptedOnly) *>
-                            errorSignal.succeedUnit *>
-                            outgoing.offer(ZChannel.failLeftUnit),
-                        elem => outgoing.offer(Exit.succeed(elem))
-                      )
+        proc = ZIO.suspendSucceed {
+          def go(outElem: OutElem, availPermits : Int) : ZIO[Env1, Either[OutErr, OutDone], Nothing] = {
+            if(0 == availPermits)
+              sem.acquire.flatMap(go(outElem, _))
+            else {
+              val fib = fibersList.forkInList {
+                f(outElem)
+                  .foldCauseZIO(
+                    cause =>
+                      failure.update(_ && cause).unless(cause.isInterruptedOnly) *>
+                        errorSignal.succeedUnit *>
+                        outgoing.offer(ZChannel.failLeftUnit),
+                    elem => outgoing.offer(Exit.succeed(elem))
                   )
-                  .interruptible
+                  .ensuring(sem.releaseOne)
               }
-            } yield ()
-          }.forever.interruptible
-            .onError(_.failureOrCause match {
-              case Left(x: Left[OutErr, OutDone]) =>
-                failure.update(_ && Cause.fail(x.value)) *>
-                  outgoing.offer(ZChannel.failLeftUnit)
-              case Left(x: Right[OutErr, OutDone]) =>
-                ZIO.fiberIdWith{currFibId =>
+
+              fib *> pull.flatMap(go(_, availPermits - 1))
+            }
+          }
+          pull.flatMap(go(_, n))
+        }
+        _ <- proc
+          .onError(_.failureOrCause match {
+            case Left(x: Left[OutErr, OutDone]) =>
+              failure.update(_ && Cause.fail(x.value)) *>
+                outgoing.offer(ZChannel.failLeftUnit)
+            case Left(x: Right[OutErr, OutDone]) =>
+              ZIO.fiberIdWith{currFibId =>
                   Fiber
                     .collectAllDiscard(fibersList.view(currFibId))
                     .await
                 }
                 .interruptible  *>
                 outgoing.offer(Exit.fail(x.asInstanceOf[Either[Unit, OutDone]]))
-              case Right(cause) =>
-                failure.update(_ && cause).unless(cause.isInterruptedOnly) *>
-                  outgoing.offer(ZChannel.failLeftUnit)
-            })
-            .ignore
-            .ensuring(fibersList.close())
-            //.raceFirst(ZChannel.awaitErrorSignal(childScope, fiberId)(errorSignal))
-            .raceFirst(errorSignal.await.interruptible)
-            .forkIn(scope)
+            case Right(cause) =>
+              failure.update(_ && cause).unless(cause.isInterruptedOnly) *>
+                outgoing.offer(ZChannel.failLeftUnit)
+          })
+          .ignore
+          .ensuring(fibersList.close())
+          //.raceFirst(ZChannel.awaitErrorSignal(childScope, fiberId)(errorSignal))
+          .raceFirst(errorSignal.await.interruptible)
+          .forkIn(scope)
       } yield {
         lazy val writer: ZChannel[Env1, Any, Any, Any, OutErr1, OutElem2, OutDone] =
           ZChannel.unwrap[Env1, Any, Any, Any, OutErr1, OutElem2, OutDone] {
@@ -2547,6 +2551,31 @@ object ZChannel {
         zio.Fiber.interruptAllAs(fibId)(/*deque.asScala.filter(fib => (fib.id != fibId) && fib.isAlive())*/ view(fibId))
       }
     }
+  }
+
+  class SingleConsumerSemaphore(maxPermits : Int) {
+    implicit val unsafe = zio.Unsafe
+    //we start at zero since the consumer knows max permits and can start performing without consulting the semaphore
+    val ref = zio.Ref.unsafe.make(0 -> null.asInstanceOf[zio.Promise[Nothing, Any]])
+
+    def acquire(implicit trace : Trace) : UIO[Int] =
+      ref.modify{
+        case (0, null) =>
+          val pr = zio.Promise.unsafe.make[Nothing, Any](FiberId.None)
+          pr.await.as(1) -> (0, pr)
+        case (n, null) =>
+          zio.Exit.succeed(n) -> (0, null)
+      }
+      .flatten
+
+    def releaseOne(implicit trace : Trace) : UIO[Unit] =
+      ref.modify{
+        case (n, null) =>
+          zio.Exit.unit -> (n + 1, null)
+        case (0, p) =>
+          p.succeed(()).unit -> (0, null)
+      }
+      .flatten
   }
 
 }
