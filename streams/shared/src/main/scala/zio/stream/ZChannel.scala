@@ -1,5 +1,6 @@
 package zio.stream
 
+import zio.internal.{FiberRuntime, FiberScope}
 import zio.internal.FiberScope.global
 import zio.{ZIO, _}
 import zio.stacktracer.TracingImplicits.disableAutoTrace
@@ -9,6 +10,7 @@ import zio.stream.internal.{AsyncInputConsumer, AsyncInputProducer, ChannelExecu
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
 import scala.annotation.tailrec
+import scala.collection.View
 import scala.collection.mutable.ListBuffer
 import scala.jdk.CollectionConverters.{IterableHasAsScala, IteratorHasAsScala, SeqHasAsJava}
 
@@ -684,54 +686,44 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
         val inFlightFibers = Array.ofDim[Fiber.Runtime[Left[Unit, Nothing], OutElem2]](maxInFlight)
         var cyclicIdx = 0
 
+        implicit val unsafe = zio.Unsafe
+
         def forkManaged(z : ZIO[Env1, Left[Unit, Nothing], OutElem2]) = {
-          //buffer may be full, in addition there may be 1 post-pop fiber, hence bufferSize+1 occupied slots
-          // hence % (bufferSize + 2) combined with the pattern of a single writer guarantees no overruns
-          val i = cyclicIdx
-          cyclicIdx = (i + 1) % maxInFlight
-          ZIO.uninterruptibleMask { restore =>
-            restore {
-              permits.withPermit {
-                z
-                  .ensuring {
-                    //the slot is effectively guarded by the semaphore
-                    inFlightFibers(i) = null
-                    zio.Exit.unit
-                  }
-              }
-            }
-            .forkDaemon
-            .map{fib =>
-              inFlightFibers(i) = fib
-              fib.unsafe.poll (zio.Unsafe) match {
-                case Some(_) =>
-                  //fiber already exited, it could have executed the ensuring section even before fib was set into this slot
-                  // so we make sure to set it to null, just in case
-                  inFlightFibers(i) = null
-                case _ =>
-              }
-              fib
+          ZIO.withFiberRuntime[Any, Nothing, FiberRuntime[Left[Unit, Nothing], OutElem2]]{ case (parentFiber, parentState) =>
+            //buffer may be full, in addition there may be 1 post-pop fiber, hence bufferSize+1 occupied slots
+            // hence % (bufferSize + 2) combined with the pattern of a single writer guarantees no overruns
+            val i = cyclicIdx
+            cyclicIdx = (i + 1) % maxInFlight
+
+            val z0 = permits.withPermit(z).ensuring(ZIO.succeed(inFlightFibers(i) = null))
+
+            //once entered this block of code, we're 'interrupt safe' except from the case we have to yield before forking
+            //in this case the fiber won't be started, however the parent fiber is now interrupted and it's guaranteed to interrupt all in flight fibers, including the unstarted one
+            val unstartedFib: FiberRuntime[Left[Unit, Nothing], OutElem2] = ZIO.unsafe.makeChildFiber(trace, z0, parentFiber, parentState.runtimeFlags, FiberScope.global)
+            inFlightFibers(i) = unstartedFib
+
+            val startFib: ZIO[Any, Nothing, FiberRuntime[Left[Unit, Nothing], OutElem2]] = ZIO.succeed{
+              unstartedFib.startConcurrently(z0)
+              unstartedFib
             }
 
+            if(parentFiber.shouldYieldBeforeFork())
+              ZIO.yieldNow *> startFib
+            else startFib
           }
         }
 
+        def fibersIterable(parentFibId : FiberId): View[Fiber.Runtime[Left[Unit, Nothing], OutElem2]] =
+          inFlightFibers
+            .view
+            .filter{fib =>
+              (null ne fib) &&
+                (fib.id != parentFibId) &&
+                fib.isAlive()
+            }
+
         def interruptInFlight = ZIO.fiberIdWith { currFibId =>
-          implicit val unsafe = zio.Unsafe
-          ZIO
-            .foreachDiscard(inFlightFibers){ fib =>
-              if( (null ne fib) && (fib.id != currFibId) && fib.unsafe.poll.isEmpty)  {
-                fib.interruptAsFork(currFibId)
-              } else
-                zio.Exit.unit
-            } *>
-            ZIO
-              .foreachDiscard(inFlightFibers){ fib =>
-                if( (null ne fib) && (fib.id != currFibId) && fib.unsafe.poll.isEmpty) {
-                  fib.await
-                } else
-                  zio.Exit.unit
-              }
+          Fiber.interruptAllAs(currFibId)(fibersIterable(currFibId))
         }
 
         val setFinalizer: UIO[Unit] =
@@ -741,8 +733,6 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
         for {
           _          <- setFinalizer
           pull       <- (queueReader >>> self).toPullInAlt(scope)
-//          childScope <- scope.fork
-//          _ <- childScope.addFinalizer(interruptInFlight)
           processElems = pull.flatMap { outElem =>
                            val latch = Promise.unsafe.make[Nothing, Unit](fiberId)(Unsafe)
                            forkManaged{
@@ -2484,10 +2474,17 @@ object ZChannel {
     implicit val unsafe = zio.Unsafe
 
     val deque = new ConcurrentLinkedDeque[Fiber.Runtime[Any, Any]]()
+    var side = true
 
     private def addForked(fib : Fiber.Runtime[Any, Any]) : Unit = {
-      deque.offerFirst(fib)
-      val itr = deque.iterator()
+      val itr = if(side) {
+        deque.offerFirst(fib)
+        deque.iterator()
+      } else {
+        deque.offerLast(fib)
+        deque.descendingIterator()
+      }
+      side = !side
       fib.unsafe.addObserver{_ =>
         itr.next() match {
           case `fib` =>
