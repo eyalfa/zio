@@ -2556,24 +2556,25 @@ object ZChannel {
   class SingleConsumerSemaphore(maxPermits : Int) {
     implicit val unsafe = zio.Unsafe
     //we start at zero since the consumer knows max permits and can start performing without consulting the semaphore
-    val ref = zio.Ref.unsafe.make(0 -> null.asInstanceOf[zio.Promise[Nothing, Any]])
+    val ref = zio.Ref.unsafe.make(Left(0).withRight[zio.Promise[Nothing, Any]])
+      //.make(0 -> null.asInstanceOf[zio.Promise[Nothing, Any]])
 
     def acquire(implicit trace : Trace) : UIO[Int] =
       ref.modify{
-        case (0, null) =>
+        case Left(0) =>
           val pr = zio.Promise.unsafe.make[Nothing, Any](FiberId.None)
-          pr.await.as(1) -> (0, pr)
-        case (n, null) =>
-          zio.Exit.succeed(n) -> (0, null)
+          pr.await.as(1) -> Right(pr)
+        case Left(n) =>
+          zio.Exit.succeed(n) -> Left(0)
       }
       .flatten
 
     def releaseOne(implicit trace : Trace) : UIO[Unit] =
       ref.modify{
-        case (n, null) =>
-          zio.Exit.unit -> (n + 1, null)
-        case (0, p) =>
-          p.succeed(()).unit -> (0, null)
+        case Left(n) =>
+          zio.Exit.unit -> Left(n + 1)
+        case Right(p) =>
+          p.succeed(()).unit -> Left(0)
       }
       .flatten
   }
