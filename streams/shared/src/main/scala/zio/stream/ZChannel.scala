@@ -823,16 +823,17 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
         errorSignal <- Promise.make[Nothing, Unit]
         failure      = Ref.unsafe.make[Cause[OutErr1]](Cause.empty)(Unsafe)
         pull        <- (queueReader >>> self).toPullInAlt(scope)
-        //childScope  <- scope.fork
-        //fibersList <- ZIO.acquireRelease(ZIO.succeed(new ZChannel.FiberList))(_.close()).provideEnvironment(ZEnvironment(childScope))
         fibersList  =  new ZChannel.FiberList
-        sem = new ZChannel.SingleConsumerSemaphore(n)
-        fiberId     <- ZIO.fiberId
-        proc = ZIO.suspendSucceed {
+        sem         = new ZChannel.SingleConsumerSemaphore(n)
+        proc        = ZIO.suspendSucceed {
+          //forker loop:
           def go(outElem: OutElem, availPermits : Int) : ZIO[Env1, Either[OutErr, OutDone], Nothing] = {
-            if(0 == availPermits)
+            if(0 == availPermits) {
+              //no more permits, acquuire some from the semaphore
               sem.acquire.flatMap(go(outElem, _))
-            else {
+            } else {
+              //game on! fork a worker and transfer the permit to the worker.
+              //notice the worker fiber is tracked by fibersList
               val fib = fibersList.forkInList {
                 f(outElem)
                   .foldCauseZIO(
@@ -842,35 +843,50 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
                         outgoing.offer(ZChannel.failLeftUnit),
                     elem => outgoing.offer(Exit.succeed(elem))
                   )
+                  //worker fiber is obligated to return the permit to the semaphore
+                  // notice, under interrupt conditions this may not be invoked (the entire fiber may not be forked)
+                  // this is not an issue since in such cases the interrupter is the forker itself and the semaphore won't be used again.
                   .ensuring(sem.releaseOne)
               }
-
+              //notice there's no issue if the forker fiber is interrupted at any point during this effect since
+              // fib is either already registered with the fibersList or not created at all, same goes for the releasing the semaphore as explained above
               fib *> pull.flatMap(go(_, availPermits - 1))
             }
           }
+          //proc starts by pulling the first message and owning ALL permits
           pull.flatMap(go(_, n))
         }
         _ <- proc
           .onError(_.failureOrCause match {
             case Left(x: Left[OutErr, OutDone]) =>
+              //upstream error
               failure.update(_ && Cause.fail(x.value)) *>
                 outgoing.offer(ZChannel.failLeftUnit)
             case Left(x: Right[OutErr, OutDone]) =>
+              //upstream completion
+              //we want to make sure all worker fibers are completed, so we leverage fibersList to await all 'survivors'
               ZIO.fiberIdWith{currFibId =>
                   Fiber
                     .collectAllDiscard(fibersList.view(currFibId))
                     .await
                 }
+                // onError runs in non-interruptible region, so we have to explicitly support interruption during the wait
                 .interruptible  *>
+                //todo: make this interruptible as well? in case the entire stream is interrupted, the queue is shut down and a blocking offer will return as interrupted
                 outgoing.offer(Exit.fail(x.asInstanceOf[Either[Unit, OutDone]]))
             case Right(cause) =>
+              //interruption (ignored), die...
               failure.update(_ && cause).unless(cause.isInterruptedOnly) *>
                 outgoing.offer(ZChannel.failLeftUnit)
           })
           .ignore
+          // make sure to interrupt and pending fibers,
+          // in the 'happy case', fibersList is empty and this is a noop
           .ensuring(fibersList.close())
-          //.raceFirst(ZChannel.awaitErrorSignal(childScope, fiberId)(errorSignal))
+          //race proc with the workers error signal, in case of error proc will be interrupted
+          // once this happens its finalizer (ensuring, see above) will interrupt all pending worker fibers
           .raceFirst(errorSignal.await.interruptible)
+          //the entire process is controlled by the channel's scope, meaning: when the channel terminates, the entire thins is interrupted (if still executing)
           .forkIn(scope)
       } yield {
         lazy val writer: ZChannel[Env1, Any, Any, Any, OutErr1, OutElem2, OutDone] =
@@ -2553,12 +2569,22 @@ object ZChannel {
     }
   }
 
+  /**
+   *  a very simplified semaphore for a single consumer and multiple releasers,
+   *  basic idea: the consumer ('forker') grabs all available permits and fires off worker fibers accordingly,
+   *  the worker fibers release the permit upon completion/termination.
+   *  once the forker runs out of permits it attempts to acquire the next round of permits,
+   *  in case there're no available permits it'd block until a worker fiber releases one, otherwise it immediately gets all avail permits atm.
+   *
+   *  notice the samaphore doesn't enforce maxPaermits, this is actually enforced by the single consumer.
+   *  */
   class SingleConsumerSemaphore(maxPermits : Int) {
     implicit val unsafe = zio.Unsafe
     //we start at zero since the consumer knows max permits and can start performing without consulting the semaphore
     val ref = zio.Ref.unsafe.make(Left(0).withRight[zio.Promise[Nothing, Any]])
-      //.make(0 -> null.asInstanceOf[zio.Promise[Nothing, Any]])
 
+    // consumer only calls this after exhausting all permit from the last time,
+    // this method either blocks untill a permit is released or immediately returns all currently available permits
     def acquire(implicit trace : Trace) : UIO[Int] =
       ref.modify{
         case Left(0) =>
@@ -2569,6 +2595,8 @@ object ZChannel {
       }
       .flatten
 
+    //releases a permit back into the semaphore, awakening the consumer if currently blocked.
+    // this is invoked by worker fibers upon completion, effectively signalling to the consumer it can enqueue more tasks.
     def releaseOne(implicit trace : Trace) : UIO[Unit] =
       ref.modify{
         case Left(n) =>
