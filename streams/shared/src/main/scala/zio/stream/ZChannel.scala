@@ -1,17 +1,13 @@
 package zio.stream
 
 import zio.internal.{FiberRuntime, FiberScope}
-import zio.stacktracer.TracingImplicits.disableAutoTrace
 import zio.stream.internal.ChannelExecutor.ChannelState
 import zio.stream.internal.{AsyncInputConsumer, AsyncInputProducer, ChannelExecutor, SingleProducerAsyncInput}
 import zio.{ZIO, _}
 
 import java.util.concurrent.ConcurrentLinkedDeque
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
-import scala.annotation.tailrec
-import scala.collection.View
-import scala.collection.mutable.ListBuffer
-import scala.jdk.CollectionConverters.{IterableHasAsScala, IteratorHasAsScala, SeqHasAsJava}
+import java.util.concurrent.atomic.AtomicReference
+import scala.jdk.CollectionConverters.IterableHasAsScala
 
 /**
  * A `ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone]` is a nexus
@@ -2599,7 +2595,7 @@ object ZChannel {
       ZIO.withFiberRuntime[R, Nothing, Fiber.Runtime[E, A]] { case (parentFiber, parentStatus) =>
         val actualFork = ZIO.succeed {
           // notice no effects at this point, so once we got into this scope we're 'interrupt free'
-          val unstartedFib = ZIO.unsafe.makeChildFiber(trace, z, parentFiber, parentStatus.runtimeFlags, global)
+          val unstartedFib = ZIO.unsafe.makeChildFiber(trace, z, parentFiber, parentStatus.runtimeFlags, FiberScope.global)
           addForked(unstartedFib)
 
           unstartedFib.startConcurrently(z)
@@ -2612,9 +2608,12 @@ object ZChannel {
           actualFork
       }
 
+    def view(currFiberId : FiberId): Iterable[Fiber.Runtime[Any, Any]] =
+      deque.asScala.view.filter(fib => (fib.id != currFiberId) && fib.isAlive())
+
     def close()(implicit trace: Trace): UIO[Unit] =
       ZIO.fiberIdWith { fibId =>
-        zio.Fiber.interruptAllAs(fibId)(deque.asScala.filter(fib => (fib.id != fibId) && fib.isAlive()))
+        zio.Fiber.interruptAllAs(fibId)(view(fibId))
       }
   }
 }
