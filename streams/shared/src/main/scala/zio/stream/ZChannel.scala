@@ -1,11 +1,17 @@
 package zio.stream
 
 import zio.internal.{FiberRuntime, FiberScope}
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 import zio.stream.internal.ChannelExecutor.ChannelState
 import zio.stream.internal.{AsyncInputConsumer, AsyncInputProducer, ChannelExecutor, SingleProducerAsyncInput}
 import zio.{ZIO, _}
 
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
+import scala.annotation.tailrec
+import scala.collection.View
+import scala.collection.mutable.ListBuffer
+import scala.jdk.CollectionConverters.{IterableHasAsScala, IteratorHasAsScala, SeqHasAsJava}
 
 /**
  * A `ZChannel[Env, InErr, InElem, InDone, OutErr, OutElem, OutDone]` is a nexus
@@ -838,18 +844,21 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
         outgoing    <- Queue.bounded[Exit[Either[Unit, OutDone], OutElem2]](bufferSize)
         _           <- scope.addFinalizer(outgoing.shutdown)
         errorSignal <- Promise.make[Nothing, Unit]
-        permits     <- Semaphore.make(n.toLong)
         failure      = Ref.unsafe.make[Cause[OutErr1]](Cause.empty)(Unsafe)
         pull        <- (queueReader >>> self).toPullInAlt(scope)
-        childScope  <- scope.fork
-        fiberId     <- ZIO.fiberId
-        _ <-
-          pull.flatMap { outElem =>
-            val latch = Promise.unsafe.make[Nothing, Unit](fiberId)(Unsafe)
-            for {
-              _ <- permits
-                     .withPermit(
-                       latch.succeedUnit *> f(outElem)
+        fibersList   = new ZChannel.FiberList
+        sem          = new ZChannel.SingleConsumerSemaphore(n)
+        proc = ZIO.suspendSucceed {
+                 // forker loop:
+                 def go(outElem: OutElem, availPermits: Int): ZIO[Env1, Either[OutErr, OutDone], Nothing] =
+                   if (0 == availPermits) {
+                     // no more permits, acquuire some from the semaphore
+                     sem.acquire.flatMap(go(outElem, _))
+                   } else {
+                     // game on! fork a worker and transfer the permit to the worker.
+                     // notice the worker fiber is tracked by fibersList
+                     val fib = fibersList.forkInList {
+                       f(outElem)
                          .foldCauseZIO(
                            cause =>
                              failure.update(_ && cause).unless(cause.isInterruptedOnly) *>
@@ -857,26 +866,50 @@ sealed trait ZChannel[-Env, -InErr, -InElem, -InDone, +OutErr, +OutElem, +OutDon
                                outgoing.offer(ZChannel.failLeftUnit),
                            elem => outgoing.offer(Exit.succeed(elem))
                          )
-                     )
-                     .interruptible
-                     .forkIn(childScope)
-              _ <- latch.await
-            } yield ()
-          }.forever.interruptible
-            .onError(_.failureOrCause match {
-              case Left(x: Left[OutErr, OutDone]) =>
-                failure.update(_ && Cause.fail(x.value)) *>
-                  outgoing.offer(ZChannel.failLeftUnit)
-              case Left(x: Right[OutErr, OutDone]) =>
-                permits.withPermits(n.toLong)(ZIO.unit).interruptible *>
-                  outgoing.offer(Exit.fail(x.asInstanceOf[Either[Unit, OutDone]]))
-              case Right(cause) =>
-                failure.update(_ && cause).unless(cause.isInterruptedOnly) *>
-                  outgoing.offer(ZChannel.failLeftUnit)
-            })
-            .ignore
-            .raceFirst(ZChannel.awaitErrorSignal(childScope, fiberId)(errorSignal))
-            .forkIn(scope)
+                         // worker fiber is obligated to return the permit to the semaphore
+                         // notice, under interrupt conditions this may not be invoked (the entire fiber may not be forked)
+                         // this is not an issue since in such cases the interrupter is the forker itself and the semaphore won't be used again.
+                         .ensuring(sem.releaseOne)
+                     }
+                     // notice there's no issue if the forker fiber is interrupted at any point during this effect since
+                     // fib is either already registered with the fibersList or not created at all, same goes for the releasing the semaphore as explained above
+                     fib *> pull.flatMap(go(_, availPermits - 1))
+                   }
+                 // proc starts by pulling the first message and owning ALL permits
+                 pull.flatMap(go(_, n))
+               }
+        _ <- proc
+               .onError(_.failureOrCause match {
+                 case Left(x: Left[OutErr, OutDone]) =>
+                   // upstream error
+                   failure.update(_ && Cause.fail(x.value)) *>
+                     outgoing.offer(ZChannel.failLeftUnit)
+                 case Left(x: Right[OutErr, OutDone]) =>
+                   // upstream completion
+                   // we want to make sure all worker fibers are completed, so we leverage fibersList to await all 'survivors'
+                   ZIO.fiberIdWith { currFibId =>
+                     Fiber
+                       .collectAllDiscard(fibersList.view(currFibId))
+                       .await
+                   }
+                     // onError runs in non-interruptible region, so we have to explicitly support interruption during the wait
+                     .interruptible *>
+                     // todo: make this interruptible as well? in case the entire stream is interrupted, the queue is shut down and a blocking offer will return as interrupted
+                     outgoing.offer(Exit.fail(x.asInstanceOf[Either[Unit, OutDone]]))
+                 case Right(cause) =>
+                   // interruption (ignored), die...
+                   failure.update(_ && cause).unless(cause.isInterruptedOnly) *>
+                     outgoing.offer(ZChannel.failLeftUnit)
+               })
+               .ignore
+               // make sure to interrupt and pending fibers,
+               // in the 'happy case', fibersList is empty and this is a noop
+               .ensuring(fibersList.close())
+               // race proc with the workers error signal, in case of error proc will be interrupted
+               // once this happens its finalizer (ensuring, see above) will interrupt all pending worker fibers
+               .raceFirst(errorSignal.await.interruptible)
+               // the entire process is controlled by the channel's scope, meaning: when the channel terminates, the entire thins is interrupted (if still executing)
+               .forkIn(scope)
       } yield {
         lazy val writer: ZChannel[Env1, Any, Any, Any, OutErr1, OutElem2, OutDone] =
           ZChannel.unwrap[Env1, Any, Any, Any, OutErr1, OutElem2, OutDone] {
@@ -2534,5 +2567,54 @@ object ZChannel {
         case Right(p) =>
           p.succeed(()).unit -> Left(0)
       }.flatten
+  }
+
+  class FiberList {
+    implicit val unsafe = zio.Unsafe
+
+    val deque = new ConcurrentLinkedDeque[Fiber.Runtime[Any, Any]]()
+    var side  = true
+
+    private def addForked(fib: Fiber.Runtime[Any, Any]): Unit = {
+      val itr = if (side) {
+        deque.offerFirst(fib)
+        deque.iterator()
+      } else {
+        deque.offerLast(fib)
+        deque.descendingIterator()
+      }
+      side = !side
+      fib.unsafe.addObserver { _ =>
+        itr.next() match {
+          case `fib` =>
+            itr.remove()
+          case other =>
+            // unexpected in the case of a single forker, can be relaxed to support multiple forkers
+            assert(null eq other)
+        }
+      }
+    }
+
+    def forkInList[R, E, A](z: ZIO[R, E, A])(implicit trace: Trace): URIO[R, Fiber.Runtime[E, A]] =
+      ZIO.withFiberRuntime[R, Nothing, Fiber.Runtime[E, A]] { case (parentFiber, parentStatus) =>
+        val actualFork = ZIO.succeed {
+          // notice no effects at this point, so once we got into this scope we're 'interrupt free'
+          val unstartedFib = ZIO.unsafe.makeChildFiber(trace, z, parentFiber, parentStatus.runtimeFlags, global)
+          addForked(unstartedFib)
+
+          unstartedFib.startConcurrently(z)
+          unstartedFib
+        }
+
+        if (parentFiber.shouldYieldBeforeFork())
+          ZIO.yieldNow *> actualFork
+        else
+          actualFork
+      }
+
+    def close()(implicit trace: Trace): UIO[Unit] =
+      ZIO.fiberIdWith { fibId =>
+        zio.Fiber.interruptAllAs(fibId)(deque.asScala.filter(fib => (fib.id != fibId) && fib.isAlive()))
+      }
   }
 }
