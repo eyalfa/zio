@@ -2608,7 +2608,7 @@ object ZChannel {
           actualFork
       }
 
-    def view(currFiberId : FiberId): Iterable[Fiber.Runtime[Any, Any]] =
+    def view(currFiberId: FiberId): Iterable[Fiber.Runtime[Any, Any]] =
       deque.asScala.view.filter(fib => (fib.id != currFiberId) && fib.isAlive())
 
     def close()(implicit trace: Trace): UIO[Unit] =
